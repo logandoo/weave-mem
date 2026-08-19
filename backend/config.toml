@@ -1,0 +1,222 @@
+# Weave Mem — 记忆系统后端配置（chatbot config 的解耦版）。
+# [server]/[security]/[database] 为 infra 段（chatbot config.toml 格式）；
+# [memory] 及全部子段、[agent.memory]、[defaults] 逐键抄自
+# chatbot backend/config_model.toml 的 memory 相关段（值用 chatbot 默认值）。
+# 部署差异（本机无外部模型服务，标注原因）：
+#   * [api] base_url/api_key/model_name 置空——LLM 调用运行时失败均被
+#     记忆管线捕获降级（BM25/摘要兜底）。
+#   * embedding_api_base/embedding_api_key 置空——无 embedding provider 时
+#     概念不带向量落库，召回走 BM25/文本路径（验收测试 4 场景）。
+#   * embedding_provider_check_on_startup=false（chatbot 默认 true）——
+#     空 provider 下启动探测必然失败会 kill-switch 整个 memory 子系统
+#     （含 scheduler），置 false 保持启用。
+#   * rerank_api_base/rerank_api_key 置空——memory_retrieval_service 对空
+#     rerank_api_base 有文档化 score_only 回退。
+
+[server]
+host = "127.0.0.1"
+port = 8202
+
+[security]
+jwt_secret_key = "weave-mem-local-dev-secret-change-me-in-production-2026"
+cors_allow_origins = ["*"]
+cors_allow_credentials = true
+
+[database]
+# type = "postgres" | "sqlite"（SQLite 降级模式：无 pgvector，召回走文本通道）
+type = "postgres"
+host = "127.0.0.1"
+port = 5432
+username = "postgres"
+password = ""
+name = "weave_mem"
+pool_size = 20
+max_overflow = 30
+pool_timeout = 30
+pool_recycle = 1800
+
+[api]
+base_url = ""
+api_key = ""
+model_name = ""
+
+[defaults]
+temperature = 0.7
+top_p = 0.9
+top_k = ""
+presence_penalty = 1.5
+frequency_penalty = 0.0
+max_tokens = ""
+
+[agent]
+name = "共享智能体"
+
+[agent.memory]
+summary_temperature = 0.2
+summary_max_tokens = 800
+summary_storage_limit = 4000
+dream_storage_limit = 4000
+default_importance = 0.85
+
+[providers]
+
+[memory]
+enabled = true
+migration_enabled = false
+retrieval_enabled = true
+subconscious_enabled = true
+recurrence_trigger_enabled = true
+dreaming_enabled = false
+cost_governance_enabled = true
+migration_max_concurrent = 2
+migration_batch_size = 5
+migration_max_retries = 5
+migration_llm_timeout_seconds = 60
+timezone = "Asia/Shanghai"
+concept_extraction_model = "default"
+concept_extraction_temperature = 0.1
+concept_extraction_max_tokens = 2000
+extraction_interval_minutes = 15
+dream_model = "default"
+dream_temperature = 0.2
+dream_max_tokens = 1500
+consolidation_dedup_threshold = 0.08
+consolidation_trigger_threshold = 20
+consolidation_max_interval_hours = 48
+query_expansion_model = "default"
+stage0_llm_enabled = false
+clarification_model = "default"
+clarification_temperature = 0.1
+clarification_auto_apply_threshold = 0.8
+embedding_model = "Qwen3-Embedding"
+embedding_api_base = ""
+embedding_api_key = ""
+embedding_dim = 1024
+embedding_dim_override = true
+embedding_provider_check_on_startup = false
+rerank_enabled = true
+stage4_llm_enabled = false
+stage4_llm_trigger_score_gap = 0.1
+rerank_mode = "cross_encoder"
+rerank_model = "Qwen3-Reranker-0.6B"
+rerank_api_base = ""
+rerank_api_key = ""
+stage4_ce_skip_strong_top_sim = 0.7
+profile_sync_enabled = true
+
+[memory.concept]
+weight_init = 0.5
+weight_recall_boost = 0.03
+weight_evidence_boost = 0.03
+trust_cap_agent_inferred = 0.7
+trust_cap_external = 0.5
+hot_forget_threshold = 0.15
+avg_weight_reset = true
+cold_resurrect_weight = 0.3
+maturation_window_days = 21
+silent_max_windows = 2
+# 2026-08-16：衰减写回 weight 列（Ebbinghaus 真正生效）——未召回概念权重逐日
+# 下降至 floor，不再永久霸榜；关闭则回到旧行为（仅 hot_forget 计数）
+weight_decay_writeback = true
+weight_decay_floor = 0.05
+
+[memory.subconscious]
+recurrence_sim_threshold = 0.6
+recurrence_count_threshold = 3
+top_k_neighbors = 5
+scan_batch_size = 50
+subconscious_retention_days = 30
+subconscious_archive_retention_days = 90
+accelerate_recurrence_threshold = 2
+
+[memory.episodic]
+merge_first_threshold = 0.85
+retrieval_k_epi = 5
+retrieval_k_concept = 10
+cross_boost_concept_weight = true
+
+[memory.multimodal]
+enabled = false
+fallback_on_cold_start = true
+provider = "default"
+snapshot_top_k = 10
+max_image_tokens = 4000
+set_of_mark = true
+fallback_first_msg_only = true
+
+[memory.cost_governance]
+rolling_window_days = 7
+warn_multiplier = 1.5
+degrade_steps = [ "rerank_off", "profile_sync_off", "stage0_off", "dreaming_step6_off", "subconscious_off",]
+per_user_independent = true
+
+[memory.retrieval]
+bootstrap_threshold = 10
+embedding_sim_threshold = 0.3
+stage1_concept_top_k = 30
+stage1_episodic_top_k = 5
+stage1_subconscious_top_k = 10
+stage2_concept_top_k = 15
+stage2_relation_expansion_enabled = true
+stage2_relation_seed_top_k = 5
+stage2_relation_max_neighbors = 5
+stage2_relation_max_new = 10
+stage2_relation_score_decay = 0.6
+stage2_relation_min_edge_weight = 0.3
+rrf_k = 60
+rrf_weight_concept = 1.0
+rrf_weight_episodic = 1.5
+rrf_weight_subconscious = 0.5
+embedding_score_weight = 0.6
+bm25_score_weight = 0.4
+injection_max_episodic = 2
+injection_max_concept = 4
+injection_max_cluster = 3
+injection_max_subconscious = 2
+injection_max_clarification = 3
+injection_total_token_budget = 2000
+# 2026-08-16：注入绝对相关分硬门槛（ScoreGate/Databricks floor）——低于门槛的
+# 概念/事件/原文不注入，打断"高权重→必注入→注入即boost"自我强化循环
+injection_min_relevance = 0.35
+injection_min_relevance_episodic = 0.30
+injection_min_relevance_subconscious = 0.30
+# 2026-08-16：召回强化门槛（Oblivion 写路径解耦）——仅绝对相关分 ≥ 该值的
+# 概念触发 weight/recency/stability 强化，弱相关注入不再回血；
+# episodic 腿（cross-boost 到 source concepts）单独门槛
+boost_min_relevance = 0.5
+boost_min_relevance_episodic = 0.40
+overview_max_concepts = 12
+overview_max_episodes = 5
+overview_max_chars = 800
+fusion_concept_relevance = 0.5
+fusion_concept_recency = 0.2
+fusion_concept_weight = 0.3
+fusion_episodic_relevance = 0.6
+fusion_episodic_recency = 0.4
+fusion_subconscious_relevance = 0.4
+fusion_subconscious_recency = 0.6
+recency_tau_days_concept = 14
+recency_tau_days_episodic = 21
+recency_tau_days_subconscious = 7
+stage4_llm_timeout_ms = 500
+stage4_cross_encoder_timeout_ms = 800
+
+[memory.concept.fatigue]
+cold_forget_threshold_episodic = 2
+cold_forget_threshold_semantic = 8
+episodic_stability_init_days = 7
+episodic_stability_growth_days = 4
+episodic_stability_max_days = 45
+semantic_stability_init_days = 14
+semantic_stability_growth_days = 7
+semantic_stability_max_days = 90
+procedural_skip_decay = true
+
+
+[mcp]
+enabled = true
+base_url = "http://127.0.0.1:8202"
+# 认证二选一：token（PAT，推荐）或 username/password（自动登录）
+token = ""
+username = "test"
+password = "123456"
