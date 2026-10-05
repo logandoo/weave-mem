@@ -5,6 +5,7 @@ No version numbers during v0.x; entries are date-based. Format loosely follows K
 ## 2026-10-05 — leftover cleanup wave
 
 ### Added
+- GitHub Actions CI (`.github/workflows/ci.yml`): scoped lint hard gate, sqlite smoke suites, pgvector full acceptance suites.
 - AGPR two-hop propagation gate (`agpr_enabled`, default off).
 - `[related memories]` grouping wrapper (`assembly_grouping_enabled`, default off) with the Proteus per-section monopoly clamp (`injection_monopoly_share=0.7`).
 - E3 listwise verifier module (default off, fail-open; parser unit-tested).
@@ -12,6 +13,7 @@ No version numbers during v0.x; entries are date-based. Format loosely follows K
 
 ### Fixed
 - Three weight read-modify-write paths made atomic/optimistic (bulk boost, cross-boost, decay writeback with stale-read guard); the heat/status legs now yield to concurrent writers.
+- SQLite dual-dialect date handling: `run_weight_decay` row dates coerced (`_as_dt`), `GET /api/memory/recall_log` tolerant of string timestamps (raw-SQL date columns come back as str on SQLite).
 - sqlite acceptance fixture resolves its DB path from config and fails fast when the server is not in sqlite mode (admin-elevation cases restored; suite now 13/13).
 - Recovery condition `today < avg×0.5` → `today ≤ avg×recovery_ratio` (stuck-forever degrade bug class).
 
