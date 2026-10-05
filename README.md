@@ -8,8 +8,10 @@ A **memory system backend service**: semantic concepts, episodic memories, dream
 
 - **Semantic concepts**: CRUD, forget (soft delete), importance/weight/confidence fields, same-name upsert merging
 - **Dual-channel recall**: pgvector cosine vector recall + PostgreSQL ILIKE text recall + BM25 hybrid retrieval, with automatic channel selection
+- **Adoption feedback loop**: an answer citing injected memory names writes back `+0.02` weight and relation edges (HTTP `POST /api/memory/adoption`, per-user hourly budget, fail-open)
+- **Recall ledger**: per-turn metadata-only log (`GET /api/memory/recall_log`) with composite-keyset pagination, sampling and retention cleanup
 - **Episodic & dream memory**: consolidation + dreaming closed loop in the service layer; the HTTP layer exposes dream/concept endpoints while episodes are consumed by the internal scheduler
-- **Deep memory stack**: 21 `memory_*` services — extraction, consolidation, dreaming, retrieval, clustering, profiling, subconscious, clarification, multimodal, cost governance, scheduler, etc.
+- **Deep memory stack**: 23 `memory_*` services — extraction, consolidation, dreaming, retrieval, clustering, profiling, subconscious, clarification, multimodal, cost governance, scheduler, etc.
 - **pgvector adaptive**: startup probe; when the extension is missing the system degrades to text recall — the service never crashes
 - **GDPR full erase**: one-click wipe of all user memory (DB + file layer)
 - **Optional embedding provider**: OpenAI-compatible API auto-vectorizes; unconfigured → `embedding` stays NULL and recall falls back to text
@@ -24,20 +26,21 @@ weave-mem/
 ├── backend/
 │   ├── app/
 │   │   ├── main.py         # FastAPI entry: init_db + pgvector probe + scheduler
-│   │   ├── api/            # auth (register/login/logout/me/PAT) + memory (16+ endpoints)
-│   │   ├── core/           # config.py config loading (config.toml + config_model.toml merge)
-│   │   ├── db/             # database.py models (17 tables) + migrations (HNSW etc.)
+│   │   ├── api/            # auth (7 routes) + memory/admin (19 routes)
+│   │   ├── core/           # config.py loading (config.toml; optional config_model.toml override)
+│   │   ├── db/             # database.py models (19 tables) + migrations (HNSW etc.)
 │   │   ├── schemas/        # pydantic models
-│   │   ├── services/       # memory stack: extraction/consolidation/dreaming/retrieval/scheduler (21 memory_* services)
+│   │   ├── services/       # memory stack: extraction/consolidation/dreaming/retrieval/adoption/ledger (23 memory_* services)
 │   │   ├── tools/          # memory path shim (file-layer memory dir resolution)
 │   │   ├── mcp/            # stdio entry for MCP (`python -m app.mcp`)
 │   │   └── mcp_server.py   # MCP server (HTTP thin forwarder)
-│   ├── config.toml         # infra + [memory] full config (148 keys)
+│   ├── config.toml         # infra + [memory] full config (179 keys)
 │   └── requirements.txt
 ├── script/linux/           # all entry points: start / stop / restart / project_build / install_venv / init_db / export_openapi
 ├── docs/
-│   └── openapi.json        # frozen OpenAPI spec (30+ endpoints)
-└── tests/                  # 9 acceptance suites (see "Testing")
+│   └── openapi.json        # frozen OpenAPI spec (32 paths)
+├── memory/                 # project memory (MEMORY.md index + topic notes)
+└── tests/                  # 13 acceptance suites (see "Testing")
 ```
 
 ## Prerequisites
@@ -135,6 +138,17 @@ embedding_dim = 1024     # must match the pgvector column dimension
 # embedding_api_base = "https://api.openai.com/v1"
 # embedding_api_key = "sk-..."
 # embedding_model = "text-embedding-3-small"
+#
+# Retrieval gates added by the 2026-10-05 sync (all in [memory.retrieval], default off
+# unless noted): strategy_route_enabled=true · concept_link_expansion_enabled=true ·
+# consistency_enabled=true · expansion_rho_enabled / agpr_enabled /
+# deterministic_edges_enabled / edge_read_whitelist_enabled / assembly_mmr_enabled /
+# assembly_grouping_enabled / contradicts_read_downgrade_enabled /
+# adaptive_cardinality_enabled / text_cross_turn_dedup_enabled /
+# merge_fast_path_enabled / merge_mst_enabled / injection_usage_instruction_enabled /
+# listwise_verifier_enabled (all false) · injection_monopoly_share=0.7 ·
+# stage0_hard_ceiling_ms=0. Ledger keys in [memory]: recall_log_enabled=true,
+# recall_log_retention_days=30, recall_log_max_per_user=20000, recall_log_sample_rate=1.0
 ```
 
 Supported environment variables:
@@ -298,6 +312,8 @@ curl -sS -X DELETE http://127.0.0.1:8202/api/memory/all -H "Authorization: Beare
 | POST | `/api/memory/recall` | recall (auto-picks vector or text channel; `?include_meta=true` returns memory_ids/top_gate_score) |
 | GET | `/api/memory/episodes` | episodic memories list |
 | POST | `/api/memory/ingest` | subconscious ingest (needs embedding provider; 503/502 degrade) |
+| POST | `/api/memory/adoption` | adoption feedback loop (answer cites injected concept names → weight/edge +0.02; per-user budget, fail-open) |
+| GET | `/api/memory/recall_log` | recall ledger (metadata only; `before_id` keyset pagination, `limit`≤200) |
 | GET | `/api/memory/dreams` | dream memory list |
 | GET | `/api/memory/clarifications` | clarification list |
 | POST | `/api/memory/clarifications/process` | clarification processing (signal words → LLM → auto-apply) |

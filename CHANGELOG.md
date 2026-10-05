@@ -2,13 +2,31 @@
 
 No version numbers during v0.x; entries are date-based. Format loosely follows Keep a Changelog.
 
-## 2026-10-05
+## 2026-10-05 — leftover cleanup wave
 
 ### Added
-- Memory-sync wave P0-P3 (+F-4a): HTTP adoption endpoint (`POST /api/memory/adoption`, budgeted, fail-open), graph-density consistency weighting, strategy routing and deterministic edges, adaptive + MMR selection, contradicts handling, fast-merge guards + MST assembly, listwise verifier module (default off), recall ledger with composite keyset pagination and dual-dialect cleanup, cluster-embedding write path with backfill script.
+- AGPR two-hop propagation gate (`agpr_enabled`, default off).
+- `[related memories]` grouping wrapper (`assembly_grouping_enabled`, default off) with the Proteus per-section monopoly clamp (`injection_monopoly_share=0.7`).
+- E3 listwise verifier module (default off, fail-open; parser unit-tested).
+- Explicit config keys with real consumers: `min_today_calls` / `recovery_ratio` (cost-governance escalation floor + recovery condition), `dream_concept_window_days` (dream lists windowed into recent-high / recent-low / fading groups).
+
 ### Fixed
-- Atomic read-modify-write paths (weights / heat / state), AGPR two-hop propagation gate, `[related memories]` grouping wrapper, no-key guards across three call sites, decay-anchor resurrection, billing-class read/write split.
-- Dead-code cleanup: 1 module, 16 functions, 1 class, 20 config keys removed.
+- Three weight read-modify-write paths made atomic/optimistic (bulk boost, cross-boost, decay writeback with stale-read guard); the heat/status legs now yield to concurrent writers.
+- sqlite acceptance fixture resolves its DB path from config and fails fast when the server is not in sqlite mode (admin-elevation cases restored; suite now 13/13).
+- Recovery condition `today < avg×0.5` → `today ≤ avg×recovery_ratio` (stuck-forever degrade bug class).
+
+### Changed
+- `strategy_route_enabled` / `concept_link_expansion_enabled` flipped on to match upstream state.
+- `migration_llm_timeout_seconds` 60 → 120; four consumer-less config keys removed.
+
+## 2026-10-05 — memory-sync wave P0-P3 (+F-4a)
+
+### Added
+- HTTP adoption endpoint (`POST /api/memory/adoption`, budgeted, fail-open), graph-density consistency weighting, strategy routing and deterministic edges, adaptive + MMR selection, contradicts handling, fast-merge guards + MST assembly, recall ledger with composite keyset pagination and dual-dialect cleanup, cluster-embedding write path with backfill script.
+- New services: `memory_adoption_service`, `memory_recall_log_service`; retrieval instrumentation with truncation notes.
+
+### Fixed
+- No-key guards across three call sites (explicit endpoint + empty key never falls back to the global LLM key), decay-anchor resurrection refresh, billing-class read/write split.
 
 ### Changed
 - Single script entry point: `script/linux/` (the former `scripts/` directory is gone).
@@ -23,7 +41,10 @@ No version numbers during v0.x; entries are date-based. Format loosely follows K
 ### Added
 - Subconscious ingest endpoint, clarification processing endpoint, and six blind-spot endpoints (concept detail, episodes, recall-meta, admin users/role, clarify apply, reload-config).
 
+### Removed
+- Dead-code cleanup: 1 module, 16 functions, 1 class, 20 config keys (user-authorized break of the chatbot diff=0 constraint).
+
 ## 2026-08-17
 
 ### Added
-- First version: split from chatbot; full memory stack (21 services: extraction / consolidation / dreaming / recall / decay / cost governance) on FastAPI + PostgreSQL + pgvector,.
+- First version: split from chatbot; full memory stack (21 services: extraction / consolidation / dreaming / recall / decay / cost governance) on FastAPI + PostgreSQL + pgvector.

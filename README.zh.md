@@ -9,9 +9,13 @@
 - **概念记忆（semantic）**：概念 CRUD、遗忘（forget，软删除）、重要性/权重/可信度字段，
   同名 upsert 自动合并
 - **双通道召回**：pgvector 余弦向量召回 + PostgreSQL ILIKE 文本召回 + BM25 混合检索，自动选择通道
+- 采纳回写：最终回答里出现注入记忆的名称或别名，就把权重和关系边权 +0.02 写回。
+  走 `POST /api/memory/adoption` 显式触发，每用户小时预算，fail-open
+- 召回台账：每轮只记元数据的召回日志（`GET /api/memory/recall_log`），
+  复合 keyset 分页，带采样和保留期清理
 - **情节记忆（episode）与梦境记忆（dream）**：服务层巩固/梦境整合闭环（consolidation/dreaming）；
   HTTP 侧暴露梦境列表与概念接口，情节记忆由内部调度器消费
-- **深度记忆栈**：21 个 `memory_*` 服务——提取、巩固、梦境、召回、聚类、画像、潜意识、澄清、
+- **深度记忆栈**：23 个 `memory_*` 服务——提取、巩固、梦境、召回、聚类、画像、潜意识、澄清、
   多模态、成本治理、调度器等
 - **pgvector 自适应**：启动探测扩展可用性，缺失时自动降级文本召回，服务不崩
 - **GDPR 全量擦除**：一键清空用户全部记忆（含文件层）
@@ -28,20 +32,21 @@ weave-mem/
 ├── backend/
 │   ├── app/
 │   │   ├── main.py         # FastAPI 入口：init_db + pgvector 探测 + 调度器
-│   │   ├── api/            # auth（注册/登录/登出/me/PAT）+ memory（16+ 端点）
-│   │   ├── core/           # config.py 配置加载（config.toml + config_model.toml 合并）
-│   │   ├── db/             # database.py 模型（17 表）+ migrations（HNSW 等）
+│   │   ├── api/            # auth（7 条路由）+ memory/admin（19 条路由）
+│   │   ├── core/           # config.py 配置加载（config.toml，config_model.toml 可选覆盖）
+│   │   ├── db/             # database.py 模型（19 表）+ migrations（HNSW 等）
 │   │   ├── schemas/        # pydantic 模型
-│   │   ├── services/       # 记忆栈：提取/巩固/梦境/召回/调度器（21 个 memory_* 服务）
+│   │   ├── services/       # 记忆栈：提取/巩固/梦境/召回/采纳/台账（23 个 memory_* 服务）
 │   │   ├── tools/          # memory 路径 shim（文件层记忆目录解析）
 │   │   ├── mcp/            # MCP stdio 入口（python -m app.mcp）
 │   │   └── mcp_server.py   # MCP server（HTTP 薄转发）
-│   ├── config.toml         # infra + [memory] 全量配置（148 键）
+│   ├── config.toml         # infra + [memory] 全量配置（179 键）
 │   └── requirements.txt
 ├── script/linux/           # 全部脚本入口：start / stop / restart / project_build / install_venv / init_db / export_openapi
 ├── docs/
-│   └── openapi.json        # 固化 OpenAPI 规范（30+ 端点）
-└── tests/                  # 9 个验收套件（见"测试"）
+│   └── openapi.json        # 固化 OpenAPI 规范（32 路径）
+├── memory/                 # 项目记忆（MEMORY.md 索引 + 主题笔记）
+└── tests/                  # 13 个验收套件（见"测试"）
 ```
 
 ## 部署前提
@@ -136,6 +141,17 @@ embedding_dim = 1024     # 需与 pgvector 列维度一致
 # embedding_api_base = "https://api.openai.com/v1"
 # embedding_api_key = "sk-..."
 # embedding_model = "text-embedding-3-small"
+#
+# 2026-10-05 同步新增的检索门控（均在 [memory.retrieval]，未注明者默认关）：
+# strategy_route_enabled=true · concept_link_expansion_enabled=true ·
+# consistency_enabled=true · expansion_rho_enabled / agpr_enabled /
+# deterministic_edges_enabled / edge_read_whitelist_enabled / assembly_mmr_enabled /
+# assembly_grouping_enabled / contradicts_read_downgrade_enabled /
+# adaptive_cardinality_enabled / text_cross_turn_dedup_enabled /
+# merge_fast_path_enabled / merge_mst_enabled / injection_usage_instruction_enabled /
+# listwise_verifier_enabled（以上全 false）· injection_monopoly_share=0.7 ·
+# stage0_hard_ceiling_ms=0。台账键在 [memory]：recall_log_enabled=true、
+# recall_log_retention_days=30、recall_log_max_per_user=20000、recall_log_sample_rate=1.0
 ```
 
 支持的环境变量：
@@ -297,6 +313,8 @@ curl -sS -X DELETE http://127.0.0.1:8202/api/memory/all -H "Authorization: Beare
 | POST | `/api/memory/recall` | 召回（自动选择向量或文本通道；`?include_meta=true` 返回 memory_ids/top_gate_score） |
 | GET | `/api/memory/episodes` | 情节记忆列表 |
 | POST | `/api/memory/ingest` | 潜意识摄入（需 embedding provider；未配置 503，故障 502） |
+| POST | `/api/memory/adoption` | 采纳回写（回答引用注入概念名 → 权重/边权 +0.02；每用户预算，fail-open） |
+| GET | `/api/memory/recall_log` | 召回台账（仅元数据；`before_id` 复合 keyset 分页，`limit`≤200） |
 | GET | `/api/memory/dreams` | 梦境记忆列表 |
 | GET | `/api/memory/clarifications` | 澄清问题列表 |
 | POST | `/api/memory/clarifications/process` | 澄清处理（信号词 → LLM 判定 → 高置信度自动应用） |
