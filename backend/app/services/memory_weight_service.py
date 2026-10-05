@@ -185,6 +185,18 @@ async def apply_reinforcement_signal(db: AsyncSession, concept_id: str, signal_t
     )
 
 
+def _as_dt(v):
+    """raw SQL 日期列双言归一：SQLite 回 str（"YYYY-MM-DD HH:MM:SS[.ffffff]"），
+    PG 回 datetime——比较/做差前统一成 datetime（本地 tz-naive）。"""
+    if v is None or isinstance(v, datetime):
+        return v
+    s = str(v).replace("T", " ")[:26]
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
 async def run_weight_decay(db: AsyncSession, user_id: str) -> dict:
     attr = config.memory_fatigue
     hot_threshold = float(config.memory_concept.get("hot_forget_threshold", 0.15))
@@ -215,6 +227,9 @@ async def run_weight_decay(db: AsyncSession, user_id: str) -> dict:
 
     for row in rows:
         cid, weight, stability, last_recalled, mem_type, hot_count, trust, status, created_at, importance, weight_decayed_at = row
+        last_recalled = _as_dt(last_recalled)
+        created_at = _as_dt(created_at)
+        weight_decayed_at = _as_dt(weight_decayed_at)
 
         if mem_type == "procedural" and skip_procedural:
             continue

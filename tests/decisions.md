@@ -34,3 +34,10 @@ options: (a) 全部本 wave 修完 (b) 口径内全修 + 具名裁决遗留
 chosen: (b) 口径内全修 + 具名裁决
 why: F-3 验收口径=apply_reinforcement_signal 原子化（已达成）；_bulk_update_concepts 等 3 处 RMW 为预存在非触碰面，深夜大改不可控；AGPR 需 2-hop 扩展路径（weave-mem 仅 1-hop 无消费者）；grouping 为格式包装非行为语义
 revisit-if: 下一 wave 按 review_package.md 遗留节逐项清（RMW 3 处 → 上游 2f4dd26f0 同款原子化；AGPR → 随 2-hop 扩展）
+
+## D-7 | 2026-10-05 | docs wave
+trigger: 「推送 github 更新」——monorepo 无 remote，目标为既有每子项目公开仓
+options: (a) 内容镜像推 weave-mem 仓 (b) subtree 历史推送 (c) 新建 monorepo 仓
+chosen: (a) 内容镜像（沿用仓既有 init/sync 提交形态）
+why: github.com/logandoo/weave-mem 已含本日代码面（并发会话 07:33 已推），缺量=文档/memory/tests 产物；note/talk 仓 HEAD 已含脚本重构（d0ce478dc/33e60c456）不重推；含会话摘录的 tests/gate_audit.md 剔除出公开集
+revisit-if: 需要保留 monorepo 历史上 GitHub，或 gate_audit 类过程件转私有仓归档

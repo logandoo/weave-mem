@@ -79,7 +79,14 @@
 - COV-9 skipped — reason: documentation-only change（无运行时可基线）
 - audit-evidence: 实物盘点（memory_* 服务 23 / 19 表 / 32 openapi 路径 / 179 配置键 / script/linux 7 入口）+ 逐条键名端点核对（11/11 键命中 config.toml、adoption/recall_log 在 openapi）+ readme_lint 前后对比（EN 63.2→63.2 事实 10→10；ZH 71.8→71.8 事实 10→10，黑话 1 与基线持平）
 - iter 1 PASS [C]: criteria 1-2（双语 README 同步 + CHANGELOG 两波拆分）| diagnosis: n/a — ZH 首轮掉 4 分（黑话「闭环」+bold 均匀占比）→ 去黑话/破均匀 bold 后回基线；CHANGELOG 死代码条目归位 2026-08-19（日期序修正）| changed: README.md（10 处）/ README.zh.md（10 处）/ CHANGELOG.md（两波拆分+归位+typo）
-- iter 2 WIP [C]: criterion 3（GitHub 推送）| diagnosis: n/a | changed: 推送镜像见后续行
+- iter 2 PASS [C]: criterion 3（GitHub 推送）| diagnosis: n/a — 内容镜像至 github.com/logandoo/weave-mem main （b0a665f..86b0cd1，15 文件 +1143；代码面经 diff 确认已在远端，缺量=文档/memory/tests 产物）；tests/gate_audit.md 含会话摘录剔除出公开集；推送前 scan_secrets --diff clean（named check）；weave-note/weave-talk 仓 HEAD 已含脚本重构（d0ce478dc/33e60c456）无需重推 | changed: /tmp/wm-push 镜像提交 86b0cd1
 - docs-drift: none（本任务即文档更新本身；readme_lint 双语达标、事实告警零新增）
 - secret-approved: weave-mem/backend/app/services/memory_embedding_service.py — api_key 变量取值为函数调用，非凭据字面量（扫描器 GENERIC_KV 假阳性）；llm_service.py "no-key" 哨兵同前 wave 记录
 - note: 独立 scan_secrets.py 对 api_key = 函数调用 假阳性（assert group 14 内嵌扫描器不命中，19/19 已证）——经裁决不为此做 .py 写入（保 Class DOC 纯文档变更面），仅本行披露
+
+## Task: GitHub CI 修复 wave（weave-mem 补 CI + SQLite 双言修复） | 2026-10-05
+- class: CODE — 变更集含逻辑修复（memory_weight_service.py / api/memory.py 双言日期）+ CI 配置（.github/workflows/ci.yml）+ 测试记录件
+- Baseline has 2 pre-existing failures → 已修复：Baseline 证据=GitHub CI 失败报告（weave-note run 37278411493 exit 127 旧脚本路径——并发会话已修绿）+ 本地 CI 预验 RED（sqlite 模式 test_sync_p0 TypeError datetime-str、test_recall_log GET 500 isoformat-str）；PG 12 套件基线绿
+- audit-evidence: 失败点定位（run_weight_decay:240 `now - created_at` str 相减 / memory.py:677 `.isoformat()` on str）+ 双言 SQL 直测复现（plain/keyset 查询 OK → 排除查询层）+ 修复后 sqlite 5/5 与 PG 12/12 对照
+- iter 1 PASS [C]: criteria 1-2（CI 三 job + 双言修复）| diagnosis: n/a — 根因=raw text() SQL 日期列 SQLite 回 str（PG 回 datetime）；修复 `_as_dt` 归一 + isoformat 双言兼容；ruff 硬核集 F401×3 归零（本 wave 早期文件未用导入）| changed: .github/workflows/ci.yml（新）/ memory_weight_service.py / api/memory.py / memory_recall_log_service.py（F401）| GREEN: sqlite 5/5 + PG 12/12 + scoped ruff CLEAN
+- iter 2 WIP [C]: criterion 3（推送+run 转绿）| diagnosis: n/a

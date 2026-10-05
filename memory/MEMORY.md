@@ -17,3 +17,6 @@
 - ⛔ 快合并模板记忆守卫（_fast_merge_name_safe）与 SAVEPOINT 隔离（_isolated_merge_item）是上游生产事故换来的一对，移植不可拆
 - ❌ 相对路径 PoC 证据包（已在 20261005 审计波记过）：证据路径必须绝对化
 - ✅ 遗留全清（2026-10-05 第二波）：AGPR 2-hop/grouping/RMW×3 原子化/E3 模块/sqlite 夹具 13/13/C-5 逐键裁决（1 键对齐+5 键确认保留）——仅 E3 装配点/jieba 部署面/concept_link 门拒收语义三项具名待场景
+- ⛔ 镜像 rsync 必须 --exclude='.git/'（--delete 会连克隆仓的 .git 一起清掉）
+- ⛔ 公开仓推送剔除含会话文本摘录的过程件（gate_audit.md 类）——秘密扫描 clean ≠ 隐私 clean
+- ⛔ raw text() SQL 日期列双言陷阱：SQLite 回 str、PG 回 datetime——比较/做差/isoformat 前必须归一（本次 run_weight_decay 与 recall_log 端点同根双炸）

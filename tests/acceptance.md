@@ -1,7 +1,7 @@
-# Acceptance Criteria — README/CHANGELOG 更新 + GitHub 推送
+# Acceptance Criteria — GitHub CI 修复 wave（weave-mem 补 CI + SQLite 双言修复）
 
 > cap=5  stall=3×
 
-1. README.md + README.zh.md 双语同步至两波现状：Core API 补 `POST /api/memory/adoption` 与 `GET /api/memory/recall_log`、配置节补本波门控/台账键、目录结构补三个新服务文件；每处声明实物核对（路径/命令/键名真实存在），readme_lint 总分不低于基线（EN 63.2 / ZH 71.8）且事实类告警不新增，双语结构一致
-2. CHANGELOG.md 2026-10-05 条目如实拆分为两波（P0-P3+F-4a 同步波 / 遗留清理波），误归档的死代码清理条目归位 2026-08-19
-3. GitHub 推送完成：weave-mem 镜像推送（含清理波 + 本次文档，形态与既有仓一致——子目录内容入仓根）；weave-note/weave-talk 经核验已同步不重复推；推送前项目文件（排除 .venv）秘密扫描干净
+1. weave-mem 补齐 GitHub Actions CI（对齐 note/talk 形态）：scoped lint（E9/F63/F7/F82/F841/F401 归零）+ sqlite 冒烟 5 套件 + PG 全量 12 套件三 job；推送后 run 转 success
+2. CI 预验揪出的 2 个 SQLite 双言 bug 修复并有回归覆盖：`run_weight_decay` raw 行日期 str 相减 TypeError（`_as_dt` 归一）、`GET /api/memory/recall_log` 的 `isoformat()` str 崩 500（双言兼容）；sqlite 模式 5 套件全绿、PG 12 套件无回归
+3. 全部 GitHub 仓 CI 状态核验：weave-mem 新 run 绿；weave-note/weave-talk 已绿（并发会话修复）不重复动；monorepo 本地留 CI 事实记录

@@ -674,7 +674,7 @@ async def list_recall_log(
         "id": r[0], "query_hash": r[1], "candidate_ids": r[2], "tier_scores": r[3],
         "gate_score": r[4], "budget_chars": r[5], "injected_chars": r[6],
         "truncated": bool(r[7]), "elapsed_ms": r[8], "cache_hit": bool(r[9]),
-        "created_at": r[10].isoformat() if r[10] else None,
+        "created_at": (r[10].isoformat() if hasattr(r[10], "isoformat") else str(r[10])) if r[10] else None,
     } for r in rows]
     return {"items": items, "total": total}
 
