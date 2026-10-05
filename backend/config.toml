@@ -71,7 +71,7 @@ cost_governance_enabled = true
 migration_max_concurrent = 2
 migration_batch_size = 5
 migration_max_retries = 5
-migration_llm_timeout_seconds = 60
+migration_llm_timeout_seconds = 120
 timezone = "Asia/Shanghai"
 concept_extraction_model = "default"
 concept_extraction_temperature = 0.1
@@ -104,6 +104,14 @@ rerank_api_key = ""
 stage4_ce_skip_strong_top_sim = 0.7
 profile_sync_enabled = true
 
+# C-6 显式键（2026-10-05：消费点=cost_governance 升降级 / consolidation dream 窗口；
+# 双审 C1 修正——仅保留有真实消费方的键；无消费方的文档键已撤（防死门）
+dream_concept_window_days = 14
+# P3 召回台账（仅元数据；读 [memory] 节——上游同款）
+recall_log_enabled = true
+recall_log_retention_days = 30
+recall_log_max_per_user = 20000
+recall_log_sample_rate = 1.0
 [memory.concept]
 weight_init = 0.5
 weight_recall_boost = 0.03
@@ -120,6 +128,7 @@ silent_max_windows = 2
 weight_decay_writeback = true
 weight_decay_floor = 0.05
 
+
 [memory.subconscious]
 recurrence_sim_threshold = 0.6
 recurrence_count_threshold = 3
@@ -135,6 +144,7 @@ retrieval_k_epi = 5
 retrieval_k_concept = 10
 cross_boost_concept_weight = true
 
+
 [memory.multimodal]
 enabled = false
 fallback_on_cold_start = true
@@ -149,6 +159,9 @@ rolling_window_days = 7
 warn_multiplier = 1.5
 degrade_steps = [ "rerank_off", "profile_sync_off", "stage0_off", "dreaming_step6_off", "subconscious_off",]
 per_user_independent = true
+
+min_today_calls = 8
+recovery_ratio = 1.0
 
 [memory.retrieval]
 bootstrap_threshold = 10
@@ -200,6 +213,47 @@ recency_tau_days_episodic = 21
 recency_tau_days_subconscious = 7
 stage4_llm_timeout_ms = 500
 stage4_cross_encoder_timeout_ms = 800
+
+# ---- 2026-10-05 chatbot 同步 wave：P2 门控（默认关=零行为变化；AB 后逐门开启）----
+# P2 策略路由（entity_dense/narrative 档覆盖 stage2 参数）
+# 2026-10-05 遗留清理：对齐上游开启态（ef3f2ebcd 用户指令开启 + a22d29c65 部署补拨）
+strategy_route_enabled = true
+# P1-② 一致性加权（verified-only；无采纳历史时恒不动）
+consistency_enabled = true
+# D1 确定性共现边 / 读侧边类型白名单
+deterministic_edges_enabled = false
+edge_read_whitelist_enabled = false
+# D2 装配升级
+# Proteus 垄断钳制（上游 _apply_token_budget_ex 同款）：单段最大份额
+injection_monopoly_share = 0.7
+assembly_mmr_enabled = false
+assembly_mmr_lambda = 0.5
+assembly_grouping_enabled = false
+contradicts_read_downgrade_enabled = false
+adaptive_cardinality_enabled = false
+adaptive_cardinality_high_score = 0.5
+text_cross_turn_dedup_enabled = false
+# D3 合并快路径/MST（读 [memory.retrieval] 门——波次时上游误读 [memory] 恒不可达，已按 0d684a16f 修）
+merge_fast_path_enabled = false
+merge_mst_enabled = false
+merge_gray_zone_low = 0.03
+# E1 注入头部使用指令（≤60 字零数字）
+injection_usage_instruction_enabled = false
+injection_usage_instruction_text = "以上历史记忆可能过时或不适用于当前任务，请结合当前对话判断。"
+# A4c stage0 LLM 硬顶（毫秒，0=关）
+stage0_hard_ceiling_ms = 0
+# W8 unit→concept 链接扩候选
+# 2026-10-05 遗留清理：对齐上游开启态（92145779d 起 config 默认开）
+concept_link_expansion_enabled = true
+concept_link_expansion_max = 3
+concept_link_expansion_units = 5
+concept_link_expansion_score = 0.45
+# D1 关系扩展 ρ 重打分 / AGPR 二跳传播（默认关）
+expansion_rho_enabled = false
+agpr_enabled = false
+# E3 listwise 验证器（默认关，fail-open）——模块+解析件已移植，装配点随任务上下文类场景接入时启用
+listwise_verifier_enabled = false
+listwise_verifier_timeout_ms = 8000
 
 [memory.concept.fatigue]
 cold_forget_threshold_episodic = 2

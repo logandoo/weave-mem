@@ -469,7 +469,7 @@ async def forget_concept(
 
 
 # =====================================================================
-# ---- weave-mem 解耦新增端点（兼容家族 scripts/smoke_test.sh）----
+# ---- weave-mem 解耦新增端点（兼容家族 script/linux/smoke_test.sh）----
 # chatbot 的 memory.py 无 /status、POST /concepts、POST /recall 三个端点
 # （chatbot 走内部服务调用与 chat 域注入）。weave-mem 作为独立记忆服务
 # 对外暴露这些入口，全部调用服务层函数（memory_concept_service /
@@ -609,6 +609,74 @@ async def ingest_endpoint(
             detail="embedding provider request failed; ingestion not persisted",
         )
     return {"unit_id": unit_id, "ingested": True}
+
+
+@router.post("/adoption")
+async def record_answer_adoption_endpoint(
+    body: dict,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """采纳反馈闭环（P1-①）：回答文本引用本轮注入概念名/别名 → 权重/边权 +0.02。
+
+    weave-mem 无 chat 流，由接入方在回答定稿时显式调用（ingest/clarify 同款
+    模式）；入参 injected_ids 取 recall?include_meta=true 的 meta.memory_ids。
+    写回 fail-open：返回摘要，绝不 500 拖垮调用方主流程。
+    """
+    answer_text = str(body.get("answer_text") or "").strip()
+    if not answer_text:
+        raise HTTPException(status_code=422, detail="answer_text required")
+    injected_ids = body.get("injected_ids") or []
+    if not isinstance(injected_ids, list):
+        raise HTTPException(status_code=422, detail="injected_ids must be a list")
+    injected_ids = [str(s) for s in injected_ids if str(s).strip()][:50]
+
+    from app.services.memory_adoption_service import record_answer_adoption
+    summary = await record_answer_adoption(db, current_user.id, injected_ids, answer_text)
+    try:
+        await db.commit()
+    except Exception:
+        # fail-open 契约：写回失败绝不 500（回滚后按 skipped 报告）
+        await db.rollback()
+        summary = {"adopted": [], "skipped": 1}
+    matched = list(summary.get("adopted") or [])
+    return {"matched": matched, "adopted": len(matched), "relation_bumped": len(matched)}
+
+
+@router.get("/recall_log")
+async def list_recall_log(
+    before_id: str | None = None,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """C1 召回台账读出：仅元数据（不含记忆内容），created_at 倒序游标分页。"""
+    from sqlalchemy import text as _text
+    limit = max(1, min(int(limit or 50), 200))
+    where = "user_id = :uid"
+    params: dict = {"uid": current_user.id, "lim": limit}
+    if before_id:
+        # 复合 keyset（created_at,id）——单 id 游标在 UUID 主键上会漏行/重行
+        where += (" AND (created_at, id) < (SELECT created_at, id FROM memory_recall_log "
+                  "WHERE id = :before AND user_id = :uid)")
+        params["before"] = str(before_id)
+    rows = (await db.execute(_text(
+        f"SELECT id, query_hash, candidate_ids, tier_scores, gate_score, budget_chars, "
+        f"injected_chars, truncated, elapsed_ms, cache_hit, created_at "
+        f"FROM memory_recall_log WHERE {where} ORDER BY created_at DESC, id DESC LIMIT :lim"),
+        params,
+    )).fetchall()
+    total = (await db.execute(_text(
+        "SELECT COUNT(*) FROM memory_recall_log WHERE user_id = :uid"),
+        {"uid": current_user.id},
+    )).scalar() or 0
+    items = [{
+        "id": r[0], "query_hash": r[1], "candidate_ids": r[2], "tier_scores": r[3],
+        "gate_score": r[4], "budget_chars": r[5], "injected_chars": r[6],
+        "truncated": bool(r[7]), "elapsed_ms": r[8], "cache_hit": bool(r[9]),
+        "created_at": r[10].isoformat() if r[10] else None,
+    } for r in rows]
+    return {"items": items, "total": total}
 
 
 @router.post("/clarifications/process")

@@ -38,13 +38,7 @@ weave-mem/
 │   │   └── mcp_server.py   # MCP server（HTTP 薄转发）
 │   ├── config.toml         # infra + [memory] 全量配置（148 键）
 │   └── requirements.txt
-├── scripts/
-│   ├── install_venv.sh     # 本项目 .venv + 依赖（幂等）
-│   ├── init_db.sh          # createdb + pgvector + 预建表（幂等）
-│   ├── start.sh
-│   ├── stop.sh
-│   ├── restart.sh
-│   └── export_openapi.sh   # 固化 OpenAPI 规范到 docs/openapi.json
+├── script/linux/           # 全部脚本入口：start / stop / restart / project_build / install_venv / init_db / export_openapi
 ├── docs/
 │   └── openapi.json        # 固化 OpenAPI 规范（30+ 端点）
 └── tests/                  # 9 个验收套件（见"测试"）
@@ -55,7 +49,7 @@ weave-mem/
 | 依赖 | 版本要求 | 说明 |
 |---|---|---|
 | 操作系统 | macOS / Ubuntu 22.04+ / Windows（WSL2 推荐，原生需 Git Bash） | 本服务无 UI，纯后端 |
-| Python | 3.11+（建议 3.13） | `scripts/install_venv.sh` 自动探测 |
+| Python | 3.11+（建议 3.13） | `script/linux/install_venv.sh` 自动探测 |
 | PostgreSQL | 14+ | 完整模式（默认，需 pgvector 扩展） |
 | pgvector | 0.5+ | 分平台安装见"安装并启用 pgvector" |
 | SQLite（aiosqlite） | - | 降级模式，零外部依赖：`[database] type = "sqlite"` |
@@ -64,9 +58,9 @@ weave-mem/
 三个脚本自包含且幂等，标准部署只需三步：
 
 ```bash
-bash scripts/install_venv.sh   # 幂等：.venv + 依赖
-bash scripts/init_db.sh        # 幂等：createdb weave_mem + pgvector + 表
-bash scripts/start.sh          # 启动（自动探测 .venv）
+bash script/linux/install_venv.sh   # 幂等：.venv + 依赖
+bash script/linux/init_db.sh        # 幂等：createdb weave_mem + pgvector + 表
+bash script/linux/start.sh          # 启动（自动探测 .venv）
 curl http://127.0.0.1:8202/healthz
 ```
 
@@ -107,7 +101,7 @@ Windows 预编译包，将 `.dll` 放入 PG 安装目录 `bin\`，`.control`/`ve
 ### 2. 虚拟环境 + 依赖
 
 ```bash
-bash scripts/install_venv.sh
+bash script/linux/install_venv.sh
 ```
 
 等价手工步骤：
@@ -154,7 +148,7 @@ embedding_dim = 1024     # 需与 pgvector 列维度一致
 | `JWT_SECRET_KEY` | JWT 密钥（config.toml 未配置时生效） |
 | `CONFIG_MODEL_PATH` | config_model.toml 路径（默认取 config.toml 同目录） |
 | `AGENT_MEMORY_DIR` | 文件层记忆目录（默认 backend/agent_memories；缺失自动降级） |
-| `PGPASSWORD` | 仅供 scripts/init_db.sh 建库时使用（服务运行不读） |
+| `PGPASSWORD` | 仅供 script/linux/init_db.sh 建库时使用（服务运行不读） |
 
 > 模型相关配置（`[api]`、`[defaults]`、`[providers]`、`[memory]` 等）可拆分到
 > `config.toml` 同目录的 `config_model.toml`（或 `CONFIG_MODEL_PATH` 指定），
@@ -163,8 +157,8 @@ embedding_dim = 1024     # 需与 pgvector 列维度一致
 ### 4. 初始化 + 启动 + 验证
 
 ```bash
-bash scripts/init_db.sh       # createdb weave_mem（幂等）+ pgvector + 预建表
-bash scripts/start.sh         # 启动（日志 weave-mem.log，PID weave-mem.pid）
+bash script/linux/init_db.sh       # createdb weave_mem（幂等）+ pgvector + 预建表
+bash script/linux/start.sh         # 启动（日志 weave-mem.log，PID weave-mem.pid）
 curl http://127.0.0.1:8202/healthz
 # 期望：{"status":"ok","service":"weave-mem","database":"ok","pgvector":true}
 ```
@@ -183,7 +177,7 @@ curl http://127.0.0.1:8202/api/memory/status -H "Authorization: Bearer $TOKEN"
 ### 5. 停止
 
 ```bash
-bash scripts/stop.sh          # 按 PID 文件安全停止（不会误杀其他进程）
+bash script/linux/stop.sh          # 按 PID 文件安全停止（不会误杀其他进程）
 ```
 
 ## SQLite 降级模式（零外部依赖）
@@ -204,7 +198,7 @@ path = "weave_mem.db"        # 相对 backend/ 解析
 | 潜意识自动提炼/向量去重/梦境向量 | 跳过（无向量） | ✓ |
 | 部署 | 零外部依赖（aiosqlite） | PG+pgvector |
 
-`scripts/init_db.sh` 自动识别 type（SQLite 免 PG）；切换回 PG 只需改 type 后重跑 init_db.sh。
+`script/linux/init_db.sh` 自动识别 type（SQLite 免 PG）；切换回 PG 只需改 type 后重跑 init_db.sh。
 健康检查在 SQLite 下返回 `"pgvector": false`（预期降级标记）。
 
 ## MCP Server（HTTP API 薄转发）
@@ -253,7 +247,7 @@ curl -sS -X DELETE http://127.0.0.1:8202/api/auth/tokens/<id> -H "Authorization:
 ## OpenAPI 规范
 
 - 运行时：`http://127.0.0.1:8202/docs`（Swagger UI）/ `/openapi.json`
-- 固化版本：`bash scripts/export_openapi.sh` → `docs/openapi.json`（30+ 端点全量）
+- 固化版本：`bash script/linux/export_openapi.sh` → `docs/openapi.json`（30+ 端点全量）
 
 ## 端到端工作流验收
 
@@ -368,7 +362,7 @@ done
 
 ```bash
 psql -U postgres -h 127.0.0.1 -d weave_mem -c 'CREATE EXTENSION IF NOT EXISTS vector;'
-bash scripts/stop.sh; bash scripts/start.sh
+bash script/linux/stop.sh; bash script/linux/start.sh
 ```
 
 ### 已创建表后修改 embedding_dim
@@ -399,6 +393,10 @@ LLM 判定调用失败时降级（服务日志出现 `Clarification LLM call fai
 
 服务不会崩溃：写入时 embedding 留空，recall 自动返回
 `"mode": "text"`；provider 恢复后重新 upsert 概念即可补齐向量。
+
+## 变更记录
+
+见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## License
 

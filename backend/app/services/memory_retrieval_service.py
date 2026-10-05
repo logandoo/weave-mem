@@ -64,6 +64,326 @@ class RetrievalCandidate:
     metadata: dict
 
 
+def apply_cross_modal_consistency(
+    candidates, *, verified_ids, bonus: float = 0.05, damp: float = 0.03,
+    rank_gap: int = 4,
+) -> None:
+    """P1-② Graph×Dense 一致性加权（上游 0121eb0a7 移植，2026-10-05）。
+
+    只对**验证过**（历史被采纳/引用）的证据做两模态对齐，全量对齐成本违例且
+    易放大噪声。以 Stage1（lex_rank）与 Stage3（dense_rank）排名快照为两模态
+    信号：
+    - 两模态都靠前（各 ≤3）→ 一致 → +bonus；
+    - 排名悬殊（|差| ≥ rank_gap）→ 分歧 → −damp（下限 0）；
+    - 其余（含无排名快照、非 verified）→ 零改动。
+
+    增量**镜像进 metadata["calibrated_score"]**（上游 A4.9 wave2 Critical 修正）：
+    `_composite_score_by_tier` 以 calibrated_score 重算终分，对 score 的改动
+    会被覆盖=死代码；calibrated 才是终分的真实输入。
+    """
+    if not verified_ids:
+        return
+    for c in candidates:
+        if c.id not in verified_ids:
+            continue
+        meta = c.metadata or {}
+        lex = meta.get("lex_rank")
+        dense = meta.get("dense_rank")
+        if lex is None or dense is None:
+            continue
+        old_score = float(c.score or 0.0)
+        if lex <= 3 and dense <= 3:
+            new_score = old_score + bonus
+        elif abs(int(lex) - int(dense)) >= rank_gap:
+            new_score = max(0.0, old_score - damp)
+        else:
+            continue
+        delta = new_score - old_score
+        c.score = new_score
+        cal = meta.get("calibrated_score")
+        if cal is not None:
+            try:
+                meta["calibrated_score"] = min(1.0, max(0.0, float(cal) + delta))
+            except (TypeError, ValueError):
+                pass
+
+
+# ---- P2 策略路由（上游 0121eb0a7/ef3f2ebcd 移植；门 strategy_route_enabled 默认关）----
+
+STRATEGY_PROFILE_DEFAULTS: dict = {
+    # rho/AGPR 维持 opt-in；两档差在关系扩展预算与衰减（entity_dense 深于
+    # 代码默认=narrative 收紧），路由开启即覆盖同名 stage2 配置。
+    "entity_dense": {
+        "stage2_relation_max_new": 12,
+        "stage2_relation_score_decay": 0.65,
+    },
+    "narrative": {
+        "stage2_relation_max_new": 5,
+        "stage2_relation_score_decay": 0.4,
+    },
+}
+
+
+def select_retrieval_profile(query_text: str, stage0, cfg: dict) -> str:
+    """P2 配置级策略路由（MLSys'26 §3.4 降级方案）。
+
+    - "entity_dense"：关键词密度高（≥0.4）→ 关系扩展加深；
+    - "narrative"：叙事/稀疏关键词 → 关系扩展收紧；
+    - "default"：strategy_route_enabled 未开（**默认关**）→ 零行为变化。
+    """
+    if not (cfg or {}).get("strategy_route_enabled", False):
+        return "default"
+    try:
+        import jieba  # type: ignore
+        tokens = [t for t in jieba.lcut(query_text or "") if t.strip()]
+    except Exception:
+        tokens = re.findall(r"[\u4e00-\u9fff]|[a-zA-Z0-9]+", query_text or "")
+    approx = max(1, len(tokens))
+    keywords = list(getattr(stage0, "keywords", None) or [])
+    density = len(keywords) / approx
+    return "entity_dense" if density >= 0.4 else "narrative"
+
+
+def strategy_profile_params(profile: str, cfg: dict) -> dict:
+    """profile → 参数覆盖（cfg `[memory.retrieval.strategy.<profile>]` 覆盖内置）。"""
+    base = dict(STRATEGY_PROFILE_DEFAULTS.get(profile, {}))
+    user = ((cfg or {}).get("strategy") or {}).get(profile)
+    if isinstance(user, dict):
+        base.update(user)
+    return base
+
+
+# ---- D1/D2 纯函数与门控件（上游 f5d2f6401 移植；各门默认关）----
+
+def _rho_score(seed_score: float, edge_weight: float, anchor_bonus: float = 1.0) -> float:
+    """D1：扩展候选 ρ = 0.5·relevance + 0.3·anchor_proximity + 0.2·anchor_bonus。"""
+    return round(0.5 * float(seed_score) + 0.3 * float(edge_weight) + 0.2 * float(anchor_bonus), 6)
+
+
+def _agpr_decay(parent_score: float, edge_weight: float, decay: float = 0.5) -> float:
+    """D1：AGPR 第二跳传播衰减（简化：父分 × 边权 × 0.5）。"""
+    return float(parent_score) * float(edge_weight) * float(decay)
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """字符二元组 Jaccard（MMR 去冗余的确定性代理；零依赖、可单测）。"""
+    def grams(s: str) -> set:
+        s = "".join(ch for ch in (s or "") if not ch.isspace())
+        if len(s) < 2:
+            return {s} if s else set()
+        return {s[i:i + 2] for i in range(len(s) - 1)}
+    ga, gb = grams(a), grams(b)
+    if not ga or not gb:
+        return 0.0
+    return len(ga & gb) / len(ga | gb)
+
+
+def _cosine(a: list, b: list) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    num = sum(x * y for x, y in zip(a, b))
+    da = sum(x * x for x in a) ** 0.5
+    db_ = sum(y * y for y in b) ** 0.5
+    if not da or not db_:
+        return 0.0
+    return num / (da * db_)
+
+
+def _mmr_select(
+    cands: list[RetrievalCandidate], k: int, lam: float = 0.5,
+    sim_fn=None, vectors: dict | None = None,
+) -> list[RetrievalCandidate]:
+    """D2（默认关）：MMR 贪心选择 gain = score − λ·max(sim(c, s∈S))。
+
+    相似度：有向量 → 余弦（维度不一致不得比较）；缺失 → 字符二元组 Jaccard。
+    """
+    if k <= 0 or not cands:
+        return []
+    if sim_fn is None:
+        _vecs = vectors or {}
+
+        def sim_fn(x, y):
+            vx, vy = _vecs.get(x.id), _vecs.get(y.id)
+            if vx and vy and len(vx) == len(vy):
+                return max(0.0, _cosine(vx, vy))
+            tx = (x.content or "") + str((x.metadata or {}).get("canonical_name") or "")
+            ty = (y.content or "") + str((y.metadata or {}).get("canonical_name") or "")
+            return _text_similarity(tx, ty)
+    selected: list[RetrievalCandidate] = []
+    pool = list(cands)
+    while pool and len(selected) < k:
+        best = None
+        best_gain = None
+        for c in pool:
+            penalty = max((sim_fn(c, s) for s in selected), default=0.0)
+            gain = float(c.score) - float(lam) * penalty
+            if best_gain is None or gain > best_gain:
+                best, best_gain = c, gain
+        selected.append(best)
+        pool.remove(best)
+    return selected
+
+
+async def _drop_contradicted(
+    db: AsyncSession, user_id: str, concept_slice: list[RetrievalCandidate],
+) -> list[RetrievalCandidate]:
+    """D2（默认关）：contradicts 读侧降级——互斥概念只保留门控分较高者。"""
+    if len(concept_slice) < 2:
+        return concept_slice
+    ids = [c.id for c in concept_slice]
+    try:
+        from app.db.database import IS_SQLITE as _IS_SQL
+        if _IS_SQL:
+            ph = ",".join(f":c{n}" for n in range(len(ids)))
+            cond = f"source_id IN ({ph}) AND target_id IN ({ph})"
+            c_params = {f"c{n}": v for n, v in enumerate(ids)}
+        else:
+            cond = "source_id = ANY(:cids) AND target_id = ANY(:cids)"
+            c_params = {"cids": ids}
+        result = await db.execute(
+            text(f"""
+                SELECT source_id, target_id FROM concept_relations
+                WHERE user_id = :u AND relation_type = 'contradicts'
+                  AND {cond}
+            """),
+            {"u": user_id, **c_params},
+        )
+        pairs = [(r[0], r[1]) for r in result.fetchall()]
+    except Exception:
+        logger.debug("contradicts read-side query failed", exc_info=True)
+        return concept_slice
+    if not pairs:
+        return concept_slice
+    by_id = {c.id: c for c in concept_slice}
+    drop: set[str] = set()
+    for a, b in pairs:
+        if a in drop or b in drop:
+            continue
+        if a not in by_id or b not in by_id:
+            continue
+        loser = a if _cand_gate_score(by_id[a]) <= _cand_gate_score(by_id[b]) else b
+        drop.add(loser)
+    return [c for c in concept_slice if c.id not in drop]
+
+
+# D2：跨轮文本去重（进程内上一轮注入 id 集，200 用户封顶）
+_text_injected_ids: dict[str, set] = {}
+
+
+def _apply_text_cross_turn_dedup(user_id: str, candidates: list) -> list:
+    """D2：上一轮已注入的 id 本轮不重复注入；剩余 <2 时放弃过滤（防空注入）。"""
+    if not config.memory_retrieval.get("text_cross_turn_dedup_enabled", False):
+        return candidates
+    prev = _text_injected_ids.get(user_id) or set()
+    if not prev:
+        return candidates
+    kept = [c for c in candidates if c.id not in prev]
+    return kept if len(kept) >= 2 else candidates
+
+
+def _remember_text_injected(user_id: str, memory_ids: list[str]) -> None:
+    if not config.memory_retrieval.get("text_cross_turn_dedup_enabled", False):
+        return
+    _text_injected_ids[user_id] = set(memory_ids or [])
+    if len(_text_injected_ids) > 200:
+        for k in list(_text_injected_ids)[:100]:
+            _text_injected_ids.pop(k, None)
+
+
+# E1（默认关）：注入头部使用指令（≤60 字符，零数字）+ C1 截断提示
+_DEFAULT_USAGE_INSTRUCTION = "以上历史记忆可能过时或不适用于当前任务，请结合当前对话判断。"
+_TRUNCATION_NOTE = "\n\n（部分记忆因长度预算未完整展示）"
+
+
+def _spawn_recall_ledger(user_id: str, query_text: str, memory_ids, stats: dict) -> None:
+    """C1 台账发射（各召回出口统一；fire-and-forget fail-open）。"""
+    try:
+        from app.services.memory_recall_log_service import spawn_recall_log
+        spawn_recall_log(user_id, query_text, memory_ids=list(memory_ids or []), stats=stats)
+    except Exception:
+        logger.debug("recall log spawn failed (fail-open)", exc_info=True)
+
+
+def _stage0_ceiling_ms(cfg: dict) -> int:
+    """A4c：stage0 LLM 硬顶毫秒（0=关，默认关）。"""
+    try:
+        return max(0, int((cfg or {}).get("stage0_hard_ceiling_ms", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _stage2b_link_expansion(
+    db: AsyncSession, user_id: str,
+    concept_candidates: list[RetrievalCandidate],
+    sub_candidates: list[RetrievalCandidate],
+    epi_candidates: list[RetrievalCandidate],
+    *,
+    enabled: Optional[bool] = None,
+) -> list[RetrievalCandidate]:
+    """unit→concept 拓扑召回扩展（WFM 2609.18182 残余闭环；门默认关）。
+
+    沿 memory_concepts.source_unit_ids 链接把命中 unit 的关联概念并入候选——
+    缺失才补（不改既有分），每轮有界，失败 fail-open。
+    """
+    if enabled is None:
+        enabled = bool(config.memory_retrieval.get("concept_link_expansion_enabled", False))
+    if not enabled:
+        return list(concept_candidates)
+    ret_cfg = config.memory_retrieval
+    max_add = max(1, int(ret_cfg.get("concept_link_expansion_max", 3)))
+    unit_window = max(1, int(ret_cfg.get("concept_link_expansion_units", 5)))
+    link_score = float(ret_cfg.get("concept_link_expansion_score", 0.45))
+    out = list(concept_candidates)
+    try:
+        seeds = (
+            sorted(sub_candidates or [], key=lambda c: c.score, reverse=True)
+            + sorted(epi_candidates or [], key=lambda c: c.score, reverse=True)
+        )[:unit_window]
+        if not seeds:
+            return out
+        existing_ids = {c.id for c in out}
+        added = 0
+        for seed in seeds:
+            if added >= max_add:
+                break
+            result = await db.execute(
+                text("SELECT id, canonical_name, description_short, description_full, "
+                     "weight, importance, source_trust, memory_type, aliases, "
+                     "last_recalled_at, stability, created_at "
+                     "FROM memory_concepts WHERE user_id = :u "
+                     "AND status IN ('active', 'silent') "
+                     "AND valid_to IS NULL "
+                     "AND source_unit_ids LIKE :pat "
+                     "ORDER BY weight DESC LIMIT 5"),
+                {"u": user_id, "pat": f'%"{seed.id}"%'},
+            )
+            for row in result.fetchall():
+                if added >= max_add:
+                    break
+                cid = row[0]
+                if cid in existing_ids:
+                    continue
+                existing_ids.add(cid)
+                added += 1
+                out.append(RetrievalCandidate(
+                    id=cid, tier="concept", score=link_score,
+                    content=row[2] or "",
+                    metadata={"canonical_name": row[1] or "",
+                              "description_full": row[3] or "",
+                              "weight": row[4] if row[4] is not None else 0.5,
+                              "importance": row[5] if row[5] is not None else 0.5,
+                              "source_trust": row[6] or "",
+                              "memory_type": row[7] or "",
+                              "aliases": row[8] or "",
+                              "last_recalled_at": row[9],
+                              "stability": row[10],
+                              "created_at": row[11],
+                              "source": "file_link_expansion"}))
+    except Exception:
+        logger.debug("concept link expansion failed (fail-open)", exc_info=True)
+    return out
+
+
 async def retrieve_with_meta(
     db: AsyncSession, user_id: str, conversation_messages: list[dict],
 ) -> tuple[str, list[str], float]:
@@ -87,10 +407,17 @@ async def retrieve_with_meta(
             [], 0.0)
 
     # §5.2 工程要求 4：会话级缓存（最近 3 轮消息哈希，TTL 5 分钟）
+    _t0 = time.monotonic()
     cache_key = _session_cache_key(user_id, user_queries)
     cached = _session_cache_get(cache_key)
     if cached is not None:
-        return cached
+        _cctx, _cids, _ctop, _cstats = cached
+        # C1 台账：cache-hit 行沿用快照 stats，cache_hit=True（dcb7ad2f4）
+        _st = dict(_cstats or {})
+        _st["cache_hit"] = True
+        _st.setdefault("elapsed_ms", (time.monotonic() - _t0) * 1000.0)
+        _spawn_recall_ledger(user_id, " ".join(user_queries), _cids, _st)
+        return _cctx, _cids, _ctop
 
     query_text = " ".join(user_queries)
     stage0 = await _stage0_query_expansion(query_text, user_id=user_id, db=db)
@@ -99,14 +426,33 @@ async def retrieve_with_meta(
     if stage0.query_type == "temporal_list":
         tctx, tids, ttop = await _temporal_list_shortcut(db, user_id, stage0)
         _session_cache_put(cache_key, tctx, (tids, ttop))
+        _spawn_recall_ledger(user_id, " ".join(user_queries), tids, {
+            "gate_score": ttop,
+            "budget_chars": int(config.memory_retrieval.get("injection_total_token_budget", 2000)),
+            "injected_chars": len(tctx), "truncated": _TRUNCATION_NOTE in tctx,
+            "elapsed_ms": (time.monotonic() - _t0) * 1000.0, "cache_hit": False})
         return tctx, tids, ttop
 
     cold_start = await _is_cold_start(db, user_id)
     if cold_start:
         ctx = await _try_cold_start_fallback(db, user_id, conversation_messages, cache_key)
         if ctx is not None:
+            # C1：冷启动召回同样是召回——台账记录（memory_ids 空）
+            _spawn_recall_ledger(user_id, " ".join(user_queries), [], {
+                "gate_score": 0.0,
+                "budget_chars": int(config.memory_retrieval.get("injection_total_token_budget", 2000)),
+                "injected_chars": len(ctx), "truncated": _TRUNCATION_NOTE in ctx,
+                "elapsed_ms": (time.monotonic() - _t0) * 1000.0, "cache_hit": False})
             return ctx, [], 0.0
     candidates = await _stage1_bm25_search(db, user_id, stage0, cold_start)
+
+    # P2 策略路由（entity_dense/narrative）：Stage2 关系扩展参数按档覆盖（门默认关）
+    _profile = select_retrieval_profile(query_text, stage0, config.memory_retrieval or {})
+    _profile_params = strategy_profile_params(_profile, config.memory_retrieval or {}) if _profile != "default" else {}
+
+    # P1-② 两模态排名快照（lex=Stage1 序；一致性加权只吃快照）
+    for _i, _c in enumerate(candidates):
+        _c.metadata["lex_rank"] = _i
 
     concept_candidates = [c for c in candidates if c.tier == "concept"]
     epi_candidates = [c for c in candidates if c.tier == "episodic"]
@@ -115,12 +461,22 @@ async def retrieve_with_meta(
     if concept_candidates:
         concept_candidates = await _stage2_description_expansion(
             db, user_id, concept_candidates, stage0, query_text,
+            param_overrides=_profile_params,
         )
+
+    # W8（门默认关）：unit→concept 链接扩候选（source_unit_ids 拓扑）
+    concept_candidates = await _stage2b_link_expansion(
+        db, user_id, concept_candidates, sub_candidates, epi_candidates,
+    )
 
     try:
         candidates = await _stage3_embedding_rerank(
             db, user_id, query_text, concept_candidates, epi_candidates, sub_candidates, stage0,
         )
+        # P1-② dense 排名快照（Stage3 成功序=向量侧序；失败降级路径不快照——
+        # 拼接序不是向量序，上游 A4.9 wave2 Minor）
+        for _i, _c in enumerate(candidates):
+            _c.metadata["dense_rank"] = _i
     except Exception:
         logger.exception("Stage 3 failed, falling back to BM25")
         candidates = concept_candidates + epi_candidates + sub_candidates
@@ -129,6 +485,15 @@ async def retrieve_with_meta(
         candidates = await _stage4_rerank(candidates, query_text, user_id=user_id, db=db, cold_start=cold_start)
     except Exception:
         logger.exception("Stage 4 failed")
+
+    # P1-②：只对验证过证据（近期被采纳概念）做图-密集一致性加权
+    if config.memory_retrieval.get("consistency_enabled", True):
+        try:
+            from app.services.memory_adoption_service import adopted_concepts_recent
+            apply_cross_modal_consistency(
+                candidates, verified_ids=adopted_concepts_recent())
+        except Exception:
+            logger.debug("cross-modal consistency failed (fail-open)", exc_info=True)
 
     final_candidates = _composite_score_by_tier(candidates, stage0)
 
@@ -141,8 +506,11 @@ async def retrieve_with_meta(
     memory_ids: list[str] = []
     top_gate_score = 0.0
     try:
+        # D2（门默认关）：上一轮已注入 id 本轮去重
+        final_candidates = _apply_text_cross_turn_dedup(user_id, final_candidates)
         injected = _select_injected(final_candidates)
         memory_ids = [c.id for tier_list in injected.values() for c in tier_list]
+        _remember_text_injected(user_id, memory_ids)
         top_gate_score = max(
             (_cand_gate_score(c) for tier_list in injected.values() for c in tier_list),
             default=0.0)
@@ -166,7 +534,19 @@ async def retrieve_with_meta(
         logger.debug("recall boost scheduling failed", exc_info=True)
 
     ctx = await _build_injection_context(db, user_id, final_candidates, stage0, query_text=query_text)
-    _session_cache_put(cache_key, ctx, (memory_ids, top_gate_score))
+    _ledger_stats = {
+        "tier_scores": {tier: round(max((_cand_gate_score(c) for c in lst), default=0.0), 4)
+                        for tier, lst in injected.items()},
+        "gate_score": top_gate_score,
+        "budget_chars": int(config.memory_retrieval.get("injection_total_token_budget", 2000)),
+        "injected_chars": len(ctx),
+        "truncated": _TRUNCATION_NOTE in ctx,
+        "elapsed_ms": (time.monotonic() - _t0) * 1000.0,
+        "cache_hit": False,
+    }
+    _session_cache_put(cache_key, ctx, (memory_ids, top_gate_score), stats=_ledger_stats)
+    # C1 台账：fire-and-forget，仅元数据
+    _spawn_recall_ledger(user_id, " ".join(user_queries), memory_ids, _ledger_stats)
     return ctx, memory_ids, top_gate_score
 
 
@@ -369,7 +749,14 @@ async def _stage0_query_expansion(
     )
     if should_llm:
         try:
-            keywords, time_range, llm_query_type, llm_include_expired = await _llm_time_normalization(query_text)
+            # A4c（上游 3378f9907）：stage0 LLM 硬顶（>0 才夹；0=关防误伤慢后端）
+            _ceiling = _stage0_ceiling_ms(config.memory_retrieval or {})
+            _coro = _llm_time_normalization(query_text)
+            if _ceiling > 0:
+                keywords, time_range, llm_query_type, llm_include_expired = await asyncio.wait_for(
+                    _coro, timeout=_ceiling / 1000.0)
+            else:
+                keywords, time_range, llm_query_type, llm_include_expired = await _coro
             return Stage0Result(
                 keywords=keywords or _jieba_keywords(query_text),
                 time_range=time_range,
@@ -529,7 +916,7 @@ def _regex_match_boost(keywords: list[str], name: str, aliases_raw: str) -> floa
 # ---- §5.2 会话级缓存（最近 3 轮消息哈希，TTL 5min） ----
 
 # 值 = (写入时刻, (ctx, memory_ids, top_gate_score))
-_session_cache: dict[str, tuple[float, tuple[str, list, float]]] = {}
+_session_cache: dict[str, tuple[float, tuple[str, list, float, dict]]] = {}
 _SESSION_CACHE_TTL = 300.0
 _EMPTY_META: tuple[list, float] = ([], 0.0)
 
@@ -540,7 +927,7 @@ def _session_cache_key(user_id: str, user_queries: list[str]) -> str:
     return f"{user_id}:{h}"
 
 
-def _session_cache_get(key: str) -> Optional[tuple[str, list, float]]:
+def _session_cache_get(key: str) -> Optional[tuple[str, list, float, dict]]:
     entry = _session_cache.get(key)
     if not entry:
         return None
@@ -551,12 +938,14 @@ def _session_cache_get(key: str) -> Optional[tuple[str, list, float]]:
     return value
 
 
-def _session_cache_put(key: str, value: str, meta: Optional[tuple[list, float]] = None) -> None:
+def _session_cache_put(key: str, value: str, meta: Optional[tuple[list, float]] = None,
+                       stats: Optional[dict] = None) -> None:
     if len(_session_cache) > 500:
         oldest = sorted(_session_cache.items(), key=lambda kv: kv[1][0])[:100]
         for k, _ in oldest:
             _session_cache.pop(k, None)
-    _session_cache[key] = (time.time(), (value, *(meta or _EMPTY_META)))
+    # C1（dcb7ad2f4）：stats 随缓存快照走——cache-hit 台账行不丢预算/截断字段
+    _session_cache[key] = (time.time(), (value, *(meta or _EMPTY_META), dict(stats or {})))
 
 
 # ---- §5.3.1a-2 多轮复现滑窗（per-user 5 轮） ----
@@ -711,12 +1100,14 @@ async def _get_subconscious_detail(db: AsyncSession, unit_id: str) -> dict | Non
 
 async def _stage2_description_expansion(
     db: AsyncSession, user_id: str, candidates: list[RetrievalCandidate],
-    stage0: Stage0Result, query_text: str,
+    stage0: Stage0Result, query_text: str, param_overrides: Optional[dict] = None,
 ) -> list[RetrievalCandidate]:
     from app.services.memory_bm25 import get_desc_index
     from app.services.memory_cluster_service import get_clusters_for_concepts, get_neighbors
 
-    ret_cfg = config.memory_retrieval
+    # P2 策略路由：profile 参数覆盖同名 stage2 配置（门开才非空）
+    ret_cfg = dict(config.memory_retrieval or {})
+    ret_cfg.update(param_overrides or {})
     query_str = " ".join(stage0.keywords)
 
     try:
@@ -781,15 +1172,22 @@ async def _stage2_description_expansion(
             max_new = int(ret_cfg.get("stage2_relation_max_new", 10))
             score_decay = float(ret_cfg.get("stage2_relation_score_decay", 0.6))
             min_edge_w = float(ret_cfg.get("stage2_relation_min_edge_weight", 0.3))
+            # D1：读侧边类型白名单（门 edge_read_whitelist_enabled，默认 None=全类型）
+            from app.services.memory_cluster_service import edge_read_whitelist
+            whitelist = edge_read_whitelist(ret_cfg)
+            rho_on = bool(ret_cfg.get("expansion_rho_enabled", False))
+            agpr_on = bool(ret_cfg.get("agpr_enabled", False))
 
             seeds = sorted([c for c in candidates if c.tier == "concept"],
                            key=lambda c: c.score, reverse=True)[:seed_top_k]
             existing_ids = {c.id for c in candidates if c.tier == "concept"}
             added = 0
+            first_hop: list[tuple[str, float]] = []
             for seed in seeds:
                 if added >= max_new:
                     break
-                neighbors = await get_neighbors(db, seed.id, min_weight=min_edge_w)
+                neighbors = await get_neighbors(db, seed.id, min_weight=min_edge_w,
+                                                allowed_types=whitelist)
                 for nb in neighbors[:max_neighbors]:
                     if added >= max_new:
                         break
@@ -800,8 +1198,11 @@ async def _stage2_description_expansion(
                     if not detail or not _concept_status_ok(detail, stage0.include_expired):
                         continue
                     edge_w = float(nb.get("weight") or 0.5)
+                    # D1（门 expansion_rho_enabled，默认关）：ρ 重打分替代 decay 公式
+                    nb_score = (_rho_score(seed.score, edge_w) if rho_on
+                                else seed.score * edge_w * score_decay)
                     candidates.append(RetrievalCandidate(
-                        id=nb_id, tier="concept", score=seed.score * edge_w * score_decay,
+                        id=nb_id, tier="concept", score=nb_score,
                         content=detail.get("description_short", ""),
                         metadata={"canonical_name": detail.get("canonical_name", ""),
                                   "description_full": detail.get("description_full", ""),
@@ -816,7 +1217,45 @@ async def _stage2_description_expansion(
                                   "source": "relation_expansion"},
                     ))
                     existing_ids.add(nb_id)
+                    first_hop.append((nb_id, nb_score))
                     added += 1
+            # D1 AGPR（门默认关）：二跳时域邻域传播（父分 × 边权 × 0.5；有界 ≤3 父 × 2 邻）
+            if agpr_on and added < max_new:
+                for parent_id, parent_score in first_hop[:3]:
+                    if added >= max_new:
+                        break
+                    try:
+                        hop2 = await get_neighbors(db, parent_id, min_weight=min_edge_w,
+                                                   allowed_types=whitelist)
+                    except Exception:
+                        continue
+                    for nb in hop2[:2]:
+                        if added >= max_new:
+                            break
+                        nb_id = nb["id"]
+                        if nb_id in existing_ids:
+                            continue
+                        detail = await _get_concept_detail(db, nb_id, user_id, include_expired=stage0.include_expired)
+                        if not detail or not _concept_status_ok(detail, stage0.include_expired):
+                            continue
+                        edge_w = float(nb.get("weight") or 0.5)
+                        candidates.append(RetrievalCandidate(
+                            id=nb_id, tier="concept", score=_agpr_decay(parent_score, edge_w),
+                            content=detail.get("description_short", ""),
+                            metadata={"canonical_name": detail.get("canonical_name", ""),
+                                      "description_full": detail.get("description_full", ""),
+                                      "weight": detail.get("weight", 0.5),
+                                      "importance": detail.get("importance", 0.5),
+                                      "source_trust": detail.get("source_trust", ""),
+                                      "memory_type": detail.get("memory_type", ""),
+                                      "aliases": detail.get("aliases", ""),
+                                      "last_recalled_at": detail.get("last_recalled_at"),
+                                      "stability": detail.get("stability"),
+                                      "created_at": detail.get("created_at"),
+                                      "source": "agpr_expansion"},
+                        ))
+                        existing_ids.add(nb_id)
+                        added += 1
         except Exception:
             logger.debug("relation expansion failed", exc_info=True)
 
@@ -1077,7 +1516,7 @@ def _cand_gate_score(c) -> float:
     #   降级模式下扩展分 = seed.score×edge×decay 可 >1 → 与 BM25 同构保留 0.5 兜底
     #   （A4.9 wave2/3 审查 I2：防降级模式下扩展召回整层消失）
     src = c.metadata.get("source")
-    if src in _BM25_SOURCES or src in ("cluster_expansion", "relation_expansion"):
+    if src in _BM25_SOURCES or src in ("cluster_expansion", "relation_expansion", "file_link_expansion", "agpr_expansion"):
         s = c.score
         try:
             s = float(s)
@@ -1646,17 +2085,39 @@ async def _build_injection_context(
         "concept": float(ret_cfg.get("injection_min_relevance", 0.35)),
         "subconscious": float(ret_cfg.get("injection_min_relevance_subconscious", 0.30)),
     }
-    epi_slice = [
+    max_epi = int(ret_cfg.get("injection_max_episodic", 2))
+    max_concept = int(ret_cfg.get("injection_max_concept", 4))
+    max_sub = int(ret_cfg.get("injection_max_subconscious", 2))
+    # D2（门默认关）：自适应基数只减不增——高门控分保持现值，低分收缩
+    if ret_cfg.get("adaptive_cardinality_enabled", False):
+        top_gate = max((_cand_gate_score(c) for c in candidates), default=0.0)
+        if top_gate < float(ret_cfg.get("adaptive_cardinality_high_score", 0.5)):
+            max_concept = min(max_concept, 2)
+            max_epi = min(max_epi, 1)
+            max_sub = min(max_sub, 1)
+    epi_eligible = [
         c for c in candidates
         if c.tier == "episodic" and c.id not in overview_eids
         and _cand_gate_score(c) >= _floors["episodic"]
-    ][:int(ret_cfg.get("injection_max_episodic", 2))]
-    concept_slice = [
+    ]
+    concept_eligible = [
         c for c in candidates
         if c.tier == "concept" and c.id not in overview_cids
         and _cand_gate_score(c) >= _floors["concept"]
-    ][:int(ret_cfg.get("injection_max_concept", 4))]
-    sub_slice = injected["subconscious"]
+    ]
+    if ret_cfg.get("assembly_mmr_enabled", False):
+        # D2（门默认关）：MMR 去冗余（向量缺失回退字符 Jaccard 代理）
+        _lam = float(ret_cfg.get("assembly_mmr_lambda", 0.5))
+        epi_slice = _mmr_select(epi_eligible, max_epi, _lam)
+        concept_slice = _mmr_select(concept_eligible, max_concept, _lam)
+        sub_slice = _mmr_select(list(injected["subconscious"]), max_sub, _lam)
+    else:
+        epi_slice = epi_eligible[:max_epi]
+        concept_slice = concept_eligible[:max_concept]
+        sub_slice = list(injected["subconscious"])[:max_sub]
+    if ret_cfg.get("contradicts_read_downgrade_enabled", False) and concept_slice:
+        # D2（门默认关）：contradicts 读侧互斥降级（保留高分端点）
+        concept_slice = await _drop_contradicted(db, user_id, concept_slice)
 
     if epi_slice:
         lines = ["[相关事件 Episodic]"]
@@ -1731,15 +2192,75 @@ async def _build_injection_context(
 
     # §5.6 注入总预算硬上限（injection_total_token_budget，默认 2000 token；
     # 中文按 1 字≈1 token 保守估算，超预算从最低优先级段开始丢弃）
+    # D2（门 assembly_grouping_enabled，默认关）：分组打包——epi/concept/sub 三段
+    # 合并为一个 [相关记忆] 包，条目带 tier 标签；episodic 内按时域序。关时逐字节不变。
+    if ret_cfg.get("assembly_grouping_enabled", False):
+        group_headers = {
+            "[相关事件 Episodic]": ("事件", "episodic"),
+            "[相关概念 Concept]": ("概念", "concept"),
+            "[近期原文片段 Subconscious]": ("原文", "subconscious"),
+        }
+        grouped_blocks: list[tuple[str, str, float, list[str]]] = []
+        remaining: list[tuple[float, str]] = []
+        for prio, sec_text in sections:
+            head = sec_text.split("\n", 1)[0]
+            if head in group_headers:
+                tag, tier = group_headers[head]
+                body_lines = [ln for ln in sec_text.split("\n")[1:] if ln.strip()]
+                grouped_blocks.append((tier, tag, prio, body_lines))
+            else:
+                remaining.append((prio, sec_text))
+        if grouped_blocks:
+            order = {"episodic": 0, "concept": 1, "subconscious": 2}
+            grouped_blocks.sort(key=lambda b: order.get(b[0], 9))
+            glines = ["[相关记忆]"]
+            for tier, tag, _prio, body_lines in grouped_blocks:
+                if tier == "episodic":
+                    # 时域序：按行首 [YYYY-MM-DD] 前缀排序（勿整行字典序）
+                    body_lines = sorted(
+                        body_lines,
+                        key=lambda ln: ln[3:14] if ln.startswith("- [") else ln)
+                for ln in body_lines:
+                    glines.append(f"{ln} [{tag}]")
+            sections = remaining + [(
+                max(b[2] for b in grouped_blocks), "\n".join(glines))]
+
     sections.sort(key=lambda s: s[0], reverse=True)
     budget = int(ret_cfg.get("injection_total_token_budget", 2000))
-    return _apply_token_budget([s[1] for s in sections], budget)
+    text, truncated, used = _apply_token_budget_ex(
+        [s[1] for s in sections], budget,
+        monopoly_share=float(ret_cfg.get("injection_monopoly_share", 0.7)))
+    # E1（默认关）：陷阱缓解——头部确定性使用指令（不计入记忆预算；≤60 字符）
+    if ret_cfg.get("injection_usage_instruction_enabled", False) and text:
+        instruction = str(ret_cfg.get("injection_usage_instruction_text")
+                          or _DEFAULT_USAGE_INSTRUCTION)[:60]
+        text = f"{instruction}\n\n{text}"
+    # C1：截断必须显式标注（信息完整性；零数字）。标注不计入记忆内容预算。
+    if truncated:
+        text += _TRUNCATION_NOTE
+    return text
 
 
 def _apply_token_budget(sections: list[str], budget: int) -> str:
     """按段优先级保留，累计估算 token ≤ budget；单段超长时截断该段。"""
+    text, _truncated, _used = _apply_token_budget_ex(sections, budget)
+    return text
+
+
+def _apply_token_budget_ex(sections: list[str], budget: int,
+                           monopoly_share: float | None = None) -> tuple[str, bool, int]:
+    """预算分配 + 截断元数据（C1 台账用）。返回 (text, truncated, used_chars)。
+
+    monopoly_share（Proteus 钳制，上游 _ex 同款）：单段最长占预算份额——防
+    分组大包/长段独占预算挤掉恒定基底（总览/画像/dream）。None=不钳（旧路径）。"""
     kept: list[str] = []
     used = 0
+    truncated = False
+    cap = int(budget * monopoly_share) if monopoly_share and monopoly_share > 0 else None
+    if cap:
+        clamped = [s[:cap] if len(s) > cap else s for s in sections]
+        truncated = truncated or any(len(a) > len(b) for a, b in zip(sections, clamped))
+        sections = clamped
     for section in sections:
         est = len(section)
         if used + est <= budget:
@@ -1748,10 +2269,12 @@ def _apply_token_budget(sections: list[str], budget: int) -> str:
         elif not kept:
             kept.append(section[:budget])
             used = budget
+            truncated = True
             break
         else:
+            truncated = True
             break
-    return "\n\n".join(kept)
+    return "\n\n".join(kept), truncated, used
 
 
 async def _get_latest_dream(db: AsyncSession, user_id: str) -> str | None:

@@ -22,7 +22,26 @@ from pathlib import Path
 import httpx
 
 BASE = "http://127.0.0.1:8202"
-DB_PATH = Path(__file__).resolve().parent.parent / "backend" / "weave_mem_sqlite_test.db"
+
+
+def _resolve_db_path() -> Path:
+    """夹具 DB 路径跟随 config（[database].path 解析，与 database_url 同逻辑）——
+    旧常量写死 weave_mem_sqlite_test.db 与服务默认 weave_mem.db 不一致，
+    admin sqlite3 提升打错库 → 403×2（ADR D-4 预存失败根因）。"""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
+    from app.core.config import get_config
+    cfg = get_config()
+    if cfg.database_type != "sqlite":
+        raise SystemExit("前置不满足：config.toml [database] type 必须为 sqlite"
+                         "（否则 admin 提升会打错库——ADR D-4 复现）")
+    raw = str((cfg._config.get("database") or {}).get("path", "weave_mem.db"))
+    pp = Path(raw)
+    if not pp.is_absolute():
+        pp = Path(cfg.config_path).resolve().parent / raw
+    return pp.resolve()
+
+
+DB_PATH = _resolve_db_path()
 passed = 0
 failed = 0
 

@@ -27,6 +27,7 @@ _user_degrade_state: dict[str, int] = {}
 async def record_llm_call(
     db: AsyncSession, user_id: str, kind: str, model: str = "",
     prompt_tokens: int = 0, completion_tokens: int = 0,
+    billing_class: str = "write",
 ) -> None:
     if not config.memory.get("cost_governance_enabled", True):
         return
@@ -37,9 +38,30 @@ async def record_llm_call(
         model=model or "",
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        billing_class=billing_class or "write",
     )
-    db.add(call)
-    await db.flush()
+    # F2（上游 3378f9907）：savepoint 隔离——计费 INSERT 失败不毒化宿主事务
+    async with db.begin_nested():
+        db.add(call)
+        await db.flush()
+
+
+async def record_llm_call_bg(
+    user_id: str, kind: str, model: str = "",
+    prompt_tokens: int = 0, completion_tokens: int = 0,
+    billing_class: str = "read",
+) -> None:
+    """DC1（上游 3378f9907）：读路径遥测独立会话、静默失败——绝不拖慢/拖垮主链路。"""
+    try:
+        from app.db.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            await record_llm_call(
+                session, user_id, kind, model=model,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                billing_class=billing_class)
+            await session.commit()
+    except Exception:
+        logger.debug("record_llm_call_bg silent-fail user=%s kind=%s", user_id, kind)
 
 
 async def _load_level(db: AsyncSession, user_id: str) -> int:
@@ -92,14 +114,14 @@ async def check_user_threshold_and_degrade(db: AsyncSession, user_id: str) -> in
     degrade_steps = cg.get("degrade_steps", [])
 
     result = await db.execute(
-        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since"),
+        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since AND COALESCE(billing_class, 'write') = 'write'"),
         {"uid": user_id, "since": datetime.utcnow() - timedelta(days=rolling_days)},
     )
     total_calls = result.scalar() or 0
     daily_avg = total_calls / rolling_days
 
     result = await db.execute(
-        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since"),
+        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since AND COALESCE(billing_class, 'write') = 'write'"),
         {"uid": user_id, "since": datetime.utcnow() - timedelta(days=1)},
     )
     today_calls = result.scalar() or 0
@@ -108,18 +130,37 @@ async def check_user_threshold_and_degrade(db: AsyncSession, user_id: str) -> in
     _user_degrade_state[user_id] = current_level
     max_level = max(len(degrade_steps), 1)
 
-    if today_calls > daily_avg * warn_mult and current_level < max_level:
+    # 2026-08-25 上游修复（A4.9 I1）：绝对下限——产品正常节奏每天 1-4 次记忆 LLM
+    # 调用，纯相对阈值 avg×warn 使普通天也触发升级且恢复条件永不满足 → 长期卡级
+    min_today_calls = float(cg.get("min_today_calls", 8))
+    recovery_ratio = float(cg.get("recovery_ratio", 1.0))
+
+    escalate_floor = max(daily_avg * warn_mult, min_today_calls)
+    if today_calls > escalate_floor and current_level < max_level:
         new_level = current_level + 1
-        reason = f"today {today_calls} > 7d avg {daily_avg:.1f} x {warn_mult}"
+        reason = (f"today {today_calls} > 7d avg {daily_avg:.1f} x {warn_mult} "
+                  f"(floor {min_today_calls:.0f})")
         await _save_level(db, user_id, new_level, reason)
         logger.warning("Cost governance: user %s degraded to level %d (%s)",
                        user_id, new_level, reason)
         return new_level
 
-    if current_level > 0 and today_calls < daily_avg * 0.5:
+    # 2026-08-25 上游修复（A4.9 I1 终版）：恢复条件 = today ≤ avg × recovery_ratio
+    # （旧 today < avg×0.5 在稳态非零使用日不可达 → burst 后永久卡死）。
+    # 恢复时保留原 reason（解释"为何降级"），不覆写为 usage recovered。
+    if current_level > 0 and today_calls <= daily_avg * recovery_ratio:
         new_level = current_level - 1
-        await _save_level(db, user_id, new_level, "usage recovered")
-        logger.info("Cost governance: user %s restored to level %d", user_id, new_level)
+        old_reason = ""
+        try:
+            raw = (await db.execute(
+                text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid"),
+                {"uid": user_id})).scalar()
+            meta = json.loads(raw) if raw else {}
+            old_reason = (meta.get("cost_governance") or {}).get("reason") or ""
+        except Exception:
+            old_reason = ""
+        await _save_level(db, user_id, new_level, old_reason or "历史降级（无触发记录）")
+        logger.info("Cost governance: user %s restored to level %d (usage recovered)", user_id, new_level)
         return new_level
 
     return current_level
@@ -166,12 +207,12 @@ async def get_user_degrade_status(db: AsyncSession, user_id: str) -> dict:
         pass
 
     result = await db.execute(
-        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since"),
+        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since AND COALESCE(billing_class, 'write') = 'write'"),
         {"uid": user_id, "since": datetime.utcnow() - timedelta(days=rolling_days)},
     )
     total_calls = result.scalar() or 0
     result = await db.execute(
-        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since"),
+        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since AND COALESCE(billing_class, 'write') = 'write'"),
         {"uid": user_id, "since": datetime.utcnow() - timedelta(days=1)},
     )
     today_calls = result.scalar() or 0

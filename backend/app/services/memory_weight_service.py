@@ -54,7 +54,21 @@ async def apply_recall_boost(db: AsyncSession, concept_ids: list[str], user_id: 
     await _bulk_update_concepts(db, concept_ids, boost, user_id)
 
 
+def _atomic_weight_expr() -> tuple[str, str]:
+    """B10 家族原子权重/稳定性 SQL 片段（双言）——值运算全部在 SQL 内，
+    并发 boost/衰变/复活互不丢更新。返回 (weight_expr, stability_expr)。"""
+    from app.db.database import IS_SQLITE
+    if IS_SQLITE:
+        return ("max(min(COALESCE(weight, 0) + :boost, :cap), 0)",
+                "min(COALESCE(stability, 14) + :growth, :max_stab)")
+    return ("GREATEST(LEAST(COALESCE(weight, 0) + CAST(:boost AS double precision), "
+            "CAST(:cap AS double precision)), 0)",
+            "LEAST(COALESCE(stability, 14) + CAST(:growth AS double precision), "
+            "CAST(:max_stab AS double precision))")
+
+
 async def _bulk_update_concepts(db: AsyncSession, concept_ids: list[str], boost: float, user_id: str | None = None) -> None:
+    w_expr, s_expr = _atomic_weight_expr()
     for cid in concept_ids:
         concept = await db.get(MemoryConcept, cid)
         if not concept:
@@ -65,23 +79,21 @@ async def _bulk_update_concepts(db: AsyncSession, concept_ids: list[str], boost:
         if concept.valid_to is not None:
             continue
         cap = _get_trust_cap(concept.source_trust)
-        concept.weight = min(concept.weight + boost, cap)
-        concept.last_recalled_at = datetime.utcnow()
-        concept.hot_forget_count = 0
-
         attr = config.memory_fatigue
-        if concept.memory_type == "semantic":
-            growth = float(attr.get("semantic_stability_growth_days", 7))
-            max_stab = float(attr.get("semantic_stability_max_days", 90))
-        elif concept.memory_type == "episodic":
+        if concept.memory_type == "episodic":
             growth = float(attr.get("episodic_stability_growth_days", 4))
             max_stab = float(attr.get("episodic_stability_max_days", 45))
         else:
             growth = float(attr.get("semantic_stability_growth_days", 7))
             max_stab = float(attr.get("semantic_stability_max_days", 90))
-
-        concept.stability = min(concept.stability + growth, max_stab)
-        concept.updated_at = datetime.utcnow()
+        # B10（上游 2f4dd26f0 同款）：原子 UPDATE——读改写在并发召回下丢更新
+        await db.execute(
+            text(f"UPDATE memory_concepts SET weight = {w_expr}, stability = {s_expr}, "
+                 "last_recalled_at = :now, hot_forget_count = 0, "
+                 "updated_at = :now WHERE id = :id AND valid_to IS NULL"),
+            {"id": cid, "boost": float(boost), "cap": float(cap),
+             "growth": growth, "max_stab": max_stab, "now": datetime.utcnow()},
+        )
 
 
 async def apply_episode_recall_boost(db: AsyncSession, episode_ids: list[str], user_id: str | None = None) -> None:
@@ -110,6 +122,7 @@ async def apply_episode_recall_boost(db: AsyncSession, episode_ids: list[str], u
                 concept_ids.extend(str(i) for i in ids)
         except (_json.JSONDecodeError, TypeError):
             continue
+    w_expr, _ = _atomic_weight_expr()
     for cid in set(concept_ids):
         concept = await db.get(MemoryConcept, cid)
         if not concept or concept.user_id != user_id:
@@ -117,8 +130,12 @@ async def apply_episode_recall_boost(db: AsyncSession, episode_ids: list[str], u
         if concept.valid_to is not None:
             continue
         cap = _get_trust_cap(concept.source_trust)
-        concept.weight = min((concept.weight or 0) + 0.02, cap)
-        concept.updated_at = datetime.utcnow()
+        # B10 家族：cross-boost 同样原子化
+        await db.execute(
+            text(f"UPDATE memory_concepts SET weight = {w_expr}, "
+                 "updated_at = :now WHERE id = :id AND valid_to IS NULL"),
+            {"id": cid, "boost": 0.02, "cap": float(cap), "now": datetime.utcnow()},
+        )
 
 
 async def apply_subconscious_recall_boost(db: AsyncSession, unit_ids: list[str]) -> None:
@@ -134,11 +151,6 @@ async def apply_subconscious_recall_boost(db: AsyncSession, unit_ids: list[str])
 
 
 async def apply_reinforcement_signal(db: AsyncSession, concept_id: str, signal_type: str) -> None:
-    concept = await db.get(MemoryConcept, concept_id)
-    if not concept or concept.valid_to is not None:
-        return
-    cap = _get_trust_cap(concept.source_trust)
-
     signal_map = {
         "recall_reference": 0.03,
         "multi_turn_recurrence": 0.05,
@@ -147,13 +159,30 @@ async def apply_reinforcement_signal(db: AsyncSession, concept_id: str, signal_t
         "clarification_constraint": -0.05,
         "dreaming_contradiction": -0.10,
         "dreaming_confirmation": 0.05,
+        # P1-①（上游 0121eb0a7）：注入证据被最终回答引用（采纳闭环）。
+        # 每轮采纳限流在 memory_adoption_service（防名字回显系统性爬升）
+        "answer_cited": 0.02,
     }
     delta = signal_map.get(signal_type, 0)
-    if delta > 0:
-        concept.weight = min(concept.weight + delta, cap)
-    elif delta < 0:
-        concept.weight = max(concept.weight + delta, 0)
-    concept.updated_at = datetime.utcnow()
+    if delta == 0:
+        return
+    concept = await db.get(MemoryConcept, concept_id)
+    if not concept or concept.valid_to is not None:
+        return
+    cap = _get_trust_cap(concept.source_trust)
+    # B10（上游 2f4dd26f0）：原子 UPDATE（旧 read-modify-write 并发丢更新）；
+    # 正向按 trust cap 封顶、负向以 0 为底，语义与旧实现一致
+    from app.db.database import IS_SQLITE
+    if IS_SQLITE:
+        bound = "max(min(COALESCE(weight, 0) + :delta, :cap), 0)"
+    else:
+        bound = ("GREATEST(LEAST(COALESCE(weight, 0) + CAST(:delta AS double precision), "
+                 "CAST(:cap AS double precision)), 0)")
+    await db.execute(
+        text(f"UPDATE memory_concepts SET weight = {bound}, updated_at = CURRENT_TIMESTAMP "
+             "WHERE id = :id AND valid_to IS NULL"),
+        {"delta": float(delta), "cap": float(cap), "id": concept_id},
+    )
 
 
 async def run_weight_decay(db: AsyncSession, user_id: str) -> dict:
@@ -228,30 +257,44 @@ async def run_weight_decay(db: AsyncSession, user_id: str) -> dict:
         strength = math.exp(-delta_days / max(stability or 14, 1))
         effective = (weight or 0) * strength
 
+        guard_won = True
         if weight_writeback:
             new_weight = max(effective, floor_w)
             if abs(new_weight - (weight or 0)) > 1e-9:
-                await db.execute(
-                    text("UPDATE memory_concepts SET weight = :w, weight_decayed_at = CURRENT_TIMESTAMP WHERE id = :id"),
-                    {"w": new_weight, "id": cid},
+                # 乐观并发守卫（B10 家族）：读取后 weight 已被并发 boost/复活改动 → 跳过
+                # 写回，绝不覆盖并发改动（丢更新防护）
+                _r = await db.execute(
+                    text("UPDATE memory_concepts SET weight = :w, weight_decayed_at = :now "
+                         "WHERE id = :id AND COALESCE(weight, 0) = :old"),
+                    {"w": new_weight, "id": cid, "old": float(weight or 0), "now": datetime.utcnow()},
                 )
+                guard_won = (_r.rowcount or 0) == 1
             effective = new_weight
+        if not guard_won:
+            # 权重守卫失手=并发改动进行中 → 热度/状态腿让权（读值已过期，双审 F1/I2）
+            continue
 
         hot_thresh = epi_hot if mem_type == "episodic" else sem_hot
 
         if effective < hot_threshold:
-            await db.execute(
-                text("UPDATE memory_concepts SET hot_forget_count = hot_forget_count + 1 WHERE id = :id"),
-                {"id": cid},
+            # 热度/状态腿同样带乐观守卫（防并发 boost 的 hot_forget_count=0 / 复活被覆盖）
+            _rh = await db.execute(
+                text("UPDATE memory_concepts SET hot_forget_count = hot_forget_count + 1 "
+                     "WHERE id = :id AND hot_forget_count = :old_hot AND status = :old_status"),
+                {"id": cid, "old_hot": int(hot_count or 0), "old_status": status},
             )
+            if not (_rh.rowcount or 0):
+                continue
             changes["hot_count_inc"] += 1
             new_hot = (hot_count or 0) + 1
             if new_hot >= hot_thresh:
-                await db.execute(
-                    text("UPDATE memory_concepts SET status = 'cold_forgotten', updated_at = CURRENT_TIMESTAMP WHERE id = :id"),
-                    {"id": cid},
+                _rs = await db.execute(
+                    text("UPDATE memory_concepts SET status = 'cold_forgotten', updated_at = CURRENT_TIMESTAMP "
+                         "WHERE id = :id AND hot_forget_count = :new_hot AND status = :old_status"),
+                    {"id": cid, "new_hot": new_hot, "old_status": status},
                 )
-                changes["cold_forgotten"] += 1
+                if _rs.rowcount:
+                    changes["cold_forgotten"] += 1
             elif not weight_writeback and avg_reset and avg_weight > 0:
                 await db.execute(
                     text("UPDATE memory_concepts SET weight = :w WHERE id = :id"),
@@ -294,13 +337,16 @@ async def try_cold_resurrect(db: AsyncSession, user_message: str, user_id: str) 
         if hit:
             if status == "cold_forgotten":
                 weight = float(config.memory_concept.get("cold_resurrect_weight", 0.3))
+                # A2/DC4（上游 3378f9907）：复活必须刷新衰减锚 weight_decayed_at，
+                # 否则次夜 run_weight_decay 以数周前的旧锚计算 effective≈0，
+                # 把刚复活的 weight 写回 floor（复活形同虚设）
                 await db.execute(
-                    text("UPDATE memory_concepts SET status = 'active', activation_strength = 1.0, weight = :w, hot_forget_count = 0, updated_at = CURRENT_TIMESTAMP WHERE id = :id"),
+                    text("UPDATE memory_concepts SET status = 'active', activation_strength = 1.0, weight = :w, hot_forget_count = 0, weight_decayed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = :id"),
                     {"w": weight, "id": cid},
                 )
             else:
                 await db.execute(
-                    text("UPDATE memory_concepts SET status = 'active', activation_strength = 1.0, updated_at = CURRENT_TIMESTAMP WHERE id = :id"),
+                    text("UPDATE memory_concepts SET status = 'active', activation_strength = 1.0, weight_decayed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = :id"),
                     {"id": cid},
                 )
             resurrected.append(cid)

@@ -16,7 +16,12 @@ class LLMService:
         self.config = get_config()
         self.is_custom_provider = bool(custom_api_url)
         base_url = custom_api_url or self.config.api_base_url
-        api_key = custom_api_key or self.config.api_key
+        if custom_api_url:
+            # no-key 守卫（上游 a207ab59f）：显式自定义端点空键 = 无需鉴权
+            # → "no-key" 占位，绝不回落全局 key
+            api_key = custom_api_key or "no-key"  # vw-approved: wire 哨兵占位，非凭据（上游 a207ab59f 守卫）
+        else:
+            api_key = self.config.api_key
         self.custom_model_name = custom_model_name
         self.client = AsyncOpenAI(
             base_url=base_url,

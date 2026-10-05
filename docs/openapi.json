@@ -943,6 +943,116 @@
         ]
       }
     },
+    "/api/memory/adoption": {
+      "post": {
+        "tags": [
+          "memory"
+        ],
+        "summary": "Record Answer Adoption Endpoint",
+        "description": "采纳反馈闭环（P1-①）：回答文本引用本轮注入概念名/别名 → 权重/边权 +0.02。\n\nweave-mem 无 chat 流，由接入方在回答定稿时显式调用（ingest/clarify 同款\n模式）；入参 injected_ids 取 recall?include_meta=true 的 meta.memory_ids。\n写回 fail-open：返回摘要，绝不 500 拖垮调用方主流程。",
+        "operationId": "record_answer_adoption_endpoint_api_memory_adoption_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/memory/recall_log": {
+      "get": {
+        "tags": [
+          "memory"
+        ],
+        "summary": "List Recall Log",
+        "description": "C1 召回台账读出：仅元数据（不含记忆内容），created_at 倒序游标分页。",
+        "operationId": "list_recall_log_api_memory_recall_log_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "before_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/memory/clarifications/process": {
       "post": {
         "tags": [

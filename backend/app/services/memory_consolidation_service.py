@@ -111,6 +111,89 @@ async def _should_consolidate(db: AsyncSession, user_id: str, state: dict) -> bo
     return elapsed >= max_hours
 
 
+async def _isolated_merge_item(db: AsyncSession, label: str, coro_factory) -> bool:
+    """单合并项 SAVEPOINT 隔离（上游 2026-09-22）——失败项不得毒化外层事务
+    （生产事故：无 savepoint 的 try/except 吞 NotNullViolation 后整夜回滚）。"""
+    try:
+        async with db.begin_nested():
+            ok = await coro_factory()
+        return bool(ok)
+    except Exception:
+        logger.warning("consolidation item failed: %s", label, exc_info=True)
+        return False
+
+
+import re as _re
+
+
+def _fast_merge_name_safe(name_a: str, name_b: str) -> bool:
+    """D3 快路径名称安全守卫（上游 2026-09-14 sweep）：数字/日期序列不同的近邻
+    （模板型记忆，如「每日任务执行记录（9月1日）vs（9月3日）」）不得无 LLM 直接
+    合并；其余要求名称包含或二元组 Jaccard ≥ 0.7。"""
+    a, b = str(name_a or "").strip(), str(name_b or "").strip()
+    if not a or not b:
+        return False
+    if _re.findall(r"\d+", a) != _re.findall(r"\d+", b):
+        return False
+    na = _re.sub(r"[的地得\s]+", "", a)
+    nb = _re.sub(r"[的地得\s]+", "", b)
+    if na and nb and (na in nb or nb in na):
+        return True
+    def _grams(s: str) -> set:
+        return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) > 1 else ({s} if s else set())
+    ga, gb = _grams(na), _grams(nb)
+    if not ga or not gb:
+        return False
+    return len(ga & gb) / len(ga | gb) >= 0.7
+
+
+def _d3_fast_path_enabled() -> bool:
+    """D3 门控读取（上游 0d684a16f 修正：键在 [memory.retrieval]，波次时误读 [memory] 恒不可达）。"""
+    return bool(config.memory_retrieval.get("merge_fast_path_enabled", False))
+
+
+def _d3_mst_enabled() -> bool:
+    return bool(config.memory_retrieval.get("merge_mst_enabled", False))
+
+
+def _d3_gray_zone_low() -> float:
+    return float(config.memory_retrieval.get("merge_gray_zone_low", 0.03))
+
+
+def _merge_pair_action(dist, low: float, thresh: float) -> str:
+    """D3 灰区路由纯函数：'fast'（<low，无 LLM）/ 'llm'（灰区）/ 'skip'（≥thresh）。
+    dist 为 None 时保守 'skip'（dcb7ad2f4 零距防御）。"""
+    if dist is None:
+        return "skip"
+    try:
+        d = float(dist)
+    except (TypeError, ValueError):
+        return "skip"
+    if d < low:
+        return "fast"
+    if d < thresh:
+        return "llm"
+    return "skip"
+
+
+def _order_pairs_mst(pairs: list, a_idx: int, b_idx: int, dist_idx: int) -> list:
+    """D3：候选对 MST 近似排序——优先两端度数之和低（避免 hub 合并），
+    同度按距离升序。纯函数。"""
+    deg: dict = {}
+    for p in pairs:
+        deg[p[a_idx]] = deg.get(p[a_idx], 0) + 1
+        deg[p[b_idx]] = deg.get(p[b_idx], 0) + 1
+
+    def _key(p):
+        try:
+            dist = float(p[dist_idx])
+        except (TypeError, ValueError, IndexError):
+            dist = 1.0
+        return (deg.get(p[a_idx], 0) + deg.get(p[b_idx], 0), dist)
+
+    return sorted(pairs, key=_key)
+
+
 async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: dict) -> None:
     """§5.5 Step 1：ANN 预筛（pgvector LATERAL）+ LLM 合并判断，概念与 episodic 合批。"""
     from app.db.database import IS_SQLITE
@@ -125,7 +208,8 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
             SELECT a.id AS a_id, a.canonical_name AS a_name, a.description_short AS a_short,
                    a.source_trust AS a_trust, a.weight AS a_weight,
                    b.id AS b_id, b.canonical_name AS b_name, b.description_short AS b_short,
-                   b.source_trust AS b_trust, b.weight AS b_weight
+                   b.source_trust AS b_trust, b.weight AS b_weight,
+                   (a.embedding <=> b.embedding) AS dist
             FROM memory_concepts a
             CROSS JOIN LATERAL (
                 SELECT id, canonical_name, description_short, source_trust, weight, embedding
@@ -147,13 +231,41 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
         """),
         {"uid": user_id, "thresh": dedup_thresh},
     )
-    concept_pairs = pairs_r.fetchall()
+    concept_pairs = list(pairs_r.fetchall())
+    # D3（门默认关）：灰区路由 fast/llm/skip + MST 排序
+    _fast_merged = 0
+    if _d3_fast_path_enabled():
+        from app.services.memory_concept_service import merge_concepts as _mc
+        _low = _d3_gray_zone_low()
+        _kept_pairs = []
+        for r in concept_pairs:
+            action = _merge_pair_action(r[10], _low, dedup_thresh)
+            if action != "fast" or not _fast_merge_name_safe(r[1], r[6]):
+                # 非 fast 或名称不安全（模板记忆）→ 灰区 LLM 判定
+                _kept_pairs.append(r)
+                continue
+            a_trust, a_w, b_w = r[3], r[4], r[9]
+            keep_a = a_trust in ("user_stated", "user_authored") or (a_w or 0) >= (b_w or 0)
+            kept_id, merged_id = (r[0], r[5]) if keep_a else (r[5], r[0])
+            ok = await _isolated_merge_item(
+                db, f"d3-fast {kept_id}<-{merged_id}",
+                lambda k=kept_id, m=merged_id: _mc(db, k, m))
+            if ok:
+                result["dedup_merged"] += 1
+                _fast_merged += 1
+            else:
+                # 失败/拒绝 → 回退 LLM 队列（上游 remaining.append 语义），绝不静默丢对
+                _kept_pairs.append(r)
+        concept_pairs = [r for r in _kept_pairs if _merge_pair_action(r[10], _low, dedup_thresh) in ("fast", "llm")]
+    if _d3_mst_enabled() and concept_pairs:
+        concept_pairs = _order_pairs_mst(list(concept_pairs), 0, 5, 10)
 
     # episodic 对（同机制，§5.5 Step 1.5）
     epi_pairs_r = await db.execute(
         text("""
             SELECT a.id AS a_id, a.narrative AS a_narr, a.valid_from AS a_vf,
-                   b.id AS b_id, b.narrative AS b_narr, b.valid_from AS b_vf
+                   b.id AS b_id, b.narrative AS b_narr, b.valid_from AS b_vf,
+                   (a.embedding <=> b.embedding) AS dist
             FROM memory_episodes a
             CROSS JOIN LATERAL (
                 SELECT id, narrative, valid_from, embedding
@@ -173,7 +285,10 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
         """),
         {"uid": user_id, "thresh": dedup_thresh},
     )
-    epi_pairs = epi_pairs_r.fetchall()
+    epi_pairs = list(epi_pairs_r.fetchall())
+    # D3：episodic 快速合并需 LLM 叙事融合（fast 无叙事源）——保守仅 MST 排序
+    if _d3_mst_enabled() and epi_pairs:
+        epi_pairs = _order_pairs_mst(list(epi_pairs), 0, 3, 6)
 
     if not concept_pairs and not epi_pairs:
         return
@@ -512,23 +627,41 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
     eff_expr = effective_weight_sql()
     # A4.9 wave2/3 审查 M4：与 overview 同构补 profile 排除（profile 概念经
     # 有效权重排序后自然下沉，但不应进入 top/bottom 名单误导 LLM 叙述）
+    # 2026-08-25 上游修复：top/bottom 原全历史无时间窗，prompt 却框定"今日记忆"，
+    # 数月前迁移导入的旧概念被叙述成"当前边缘主题"——按 dream_concept_window_days
+    # 窗口拆三组：近窗高频 / 近窗低频 / 待遗忘候选（超窗未再现，一句带过）。
+    from datetime import timedelta as _td
+    window_days = int(config.memory.get("dream_concept_window_days", 14))
+    window_since = datetime.utcnow() - _td(days=window_days)
+    base_filter = ("status = 'active' AND activation_strength > 0.05 "
+                   "AND valid_to IS NULL AND memory_type != 'profile'")
+    recent_filter = f"({base_filter} AND (last_recalled_at >= :since OR created_at >= :since))"
     top_r = await db.execute(
         text(f"SELECT canonical_name, ROUND(CAST({eff_expr} AS numeric), 2) "
-             "FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 "
-             "AND valid_to IS NULL AND memory_type != 'profile' "
-             "ORDER BY " + eff_expr + " DESC LIMIT 10"),
-        {"uid": user_id},
+             f"FROM memory_concepts WHERE user_id = :uid AND {recent_filter} "
+             "ORDER BY " + eff_expr + " DESC, last_recalled_at DESC NULLS LAST LIMIT 10"),
+        {"uid": user_id, "since": window_since},
     )
     top_concepts = [{"name": r[0], "weight": float(r[1] or 0)} for r in top_r.fetchall()]
 
     bottom_r = await db.execute(
         text(f"SELECT canonical_name, ROUND(CAST({eff_expr} AS numeric), 2) "
-             "FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 "
-             "AND valid_to IS NULL AND memory_type != 'profile' "
-             "ORDER BY " + eff_expr + " ASC LIMIT 10"),
-        {"uid": user_id},
+             f"FROM memory_concepts WHERE user_id = :uid AND {recent_filter} "
+             "ORDER BY " + eff_expr + " ASC, last_recalled_at DESC NULLS LAST LIMIT 10"),
+        {"uid": user_id, "since": window_since},
     )
     bottom_concepts = [{"name": r[0], "weight": float(r[1] or 0)} for r in bottom_r.fetchall()]
+
+    # COALESCE 形式（上游 :792 同款）：last_recalled_at 可为 NULL——
+    # NOT(… OR …) 的三值逻辑会把"从未召回的旧导入"从两组名单同时丢掉
+    forgotten_r = await db.execute(
+        text(f"SELECT canonical_name, ROUND(CAST({eff_expr} AS numeric), 2) "
+             f"FROM memory_concepts WHERE user_id = :uid AND {base_filter} "
+             "AND COALESCE(last_recalled_at, created_at) < :since "
+             "ORDER BY " + eff_expr + " ASC LIMIT 10"),
+        {"uid": user_id, "since": window_since},
+    )
+    forgotten_concepts = [{"name": r[0], "weight": float(r[1] or 0)} for r in forgotten_r.fetchall()]
 
     cluster_r = await db.execute(
         text("SELECT name, member_count FROM memory_clusters WHERE user_id = :uid ORDER BY member_count DESC LIMIT 10"),
@@ -548,6 +681,7 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
         "今日合并概念对数": result["dedup_merged"],
         "今日澄清": clarifications,
         "top10权重概念": top_concepts,
+        "待遗忘候选（超窗未再现，只可一句带过）": forgotten_concepts,
         "bottom10权重概念": bottom_concepts,
         "概念集合": clusters,
         "冷遗忘数": result["cold_forgotten"],

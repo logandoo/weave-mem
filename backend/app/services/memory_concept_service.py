@@ -104,6 +104,14 @@ async def extract_concepts_from_recurrence(
     if epic_data and epic_data.get("narrative"):
         episode_id = await _handle_episode_from_extraction(db, user_id, epic_data, source_unit_ids, concept_ids)
 
+    # D1（门 deterministic_edges_enabled，默认关）：提炼后建确定性共现边（fail-open）
+    if concept_ids and config.memory_retrieval.get("deterministic_edges_enabled", False):
+        try:
+            from app.services.memory_cluster_service import build_deterministic_edges
+            await build_deterministic_edges(db, user_id, concept_ids)
+        except Exception:
+            logger.debug("deterministic edges hook failed (fail-open)", exc_info=True)
+
     # §5.1.d step 4：同步 total_concept_count / total_episode_count
     await db.execute(
         text("""UPDATE user_agent_states SET
@@ -126,6 +134,13 @@ async def _handle_episode_from_extraction(
     merge_with = epic_data.get("merge_with_episode_id")
     narrative = epic_data.get("narrative", "")
     valid_from_str = epic_data.get("valid_from")
+    # D1 P/L（上游 f5d2f6401）：提取 JSON 的 participants/locations 贯穿到 episode 写路径
+    participants = epic_data.get("participants")
+    locations = epic_data.get("locations")
+    if isinstance(participants, list):
+        participants = json.dumps(participants, ensure_ascii=False)
+    if isinstance(locations, list):
+        locations = json.dumps(locations, ensure_ascii=False)
 
     valid_from = datetime.utcnow()
     if valid_from_str:
@@ -137,19 +152,22 @@ async def _handle_episode_from_extraction(
     if merge_with and isinstance(merge_with, str):
         target = await db.get(MemoryEpisode, merge_with)
         if target is not None and target.user_id == user_id:
-            await merge_episode(db, merge_with, narrative, source_unit_ids)
+            await merge_episode(db, merge_with, narrative, source_unit_ids,
+                                participants=participants, locations=locations)
             return merge_with
         logger.warning("merge_with_episode_id rejected (missing or cross-user): %s", merge_with)
 
     # §4.9 merge-first：LLM 未给 merge id 时，按 sim≥0.85 最近邻 in-place 合并
     try:
-        merged_id = await merge_first(db, user_id, narrative, source_unit_ids)
+        merged_id = await merge_first(db, user_id, narrative, source_unit_ids,
+                                      participants=participants, locations=locations)
         if merged_id:
             return merged_id
     except Exception:
         logger.debug("merge_first failed, fallback to create", exc_info=True)
 
-    eid = await create_episode(db, user_id, narrative, valid_from, source_unit_ids, concept_ids)
+    eid = await create_episode(db, user_id, narrative, valid_from, source_unit_ids, concept_ids,
+                               participants=participants, locations=locations)
     return eid
 
 
@@ -340,6 +358,13 @@ async def _ensure_cluster_membership(
             text("INSERT INTO concept_cluster_members (concept_id, cluster_id) VALUES (:cid, :clid) ON CONFLICT DO NOTHING"),
             {"cid": concept_id, "clid": cid},
         )
+        cluster_id = cid
+    # F-4a（上游 A1/DC2）：成员变更后刷新簇 embedding（成员向量均值 + 溯源模型）
+    try:
+        from app.services.memory_cluster_service import _update_cluster_embedding
+        await _update_cluster_embedding(db, cluster_id)
+    except Exception:
+        logger.debug("cluster embedding refresh failed (fail-open)", exc_info=True)
 
 
 def _update_bm25_on_concept_change(concept_id: str, user_id: str, name: str, aliases_json: str, desc_full: str) -> None:

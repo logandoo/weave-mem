@@ -4,13 +4,13 @@
 # 优先级：环境变量 PYTHON_BIN > python3.13 > python3.12 > python3.11 > python3 > python > py（若 ≥3.11）。
 # 跨平台：macOS/Linux 用 .venv/bin/python，Windows 用 .venv/Scripts/python.exe 均可识别。
 #
-# 用法：bash scripts/install_venv.sh
+# 用法：bash script/linux/install_venv.sh
 # 环境变量：
 #   PYTHON_BIN  解释器（显式指定时跳过自动探测）
 #   VENV_DIR    venv 位置（默认 <项目根>/.venv）
 set -euo pipefail
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VENV_DIR="${VENV_DIR:-$DIR/.venv}"
 
 # venv 内解释器路径（跨平台）：优先 bin/python（mac/Linux），其次 Scripts/python.exe（Windows）

@@ -34,13 +34,7 @@ weave-mem/
 │   │   └── mcp_server.py   # MCP server (HTTP thin forwarder)
 │   ├── config.toml         # infra + [memory] full config (148 keys)
 │   └── requirements.txt
-├── scripts/
-│   ├── install_venv.sh     # project .venv + deps (idempotent)
-│   ├── init_db.sh          # createdb + pgvector + prebuild tables (idempotent)
-│   ├── start.sh
-│   ├── stop.sh
-│   ├── restart.sh
-│   └── export_openapi.sh   # freeze OpenAPI spec to docs/openapi.json
+├── script/linux/           # all entry points: start / stop / restart / project_build / install_venv / init_db / export_openapi
 ├── docs/
 │   └── openapi.json        # frozen OpenAPI spec (30+ endpoints)
 └── tests/                  # 9 acceptance suites (see "Testing")
@@ -51,7 +45,7 @@ weave-mem/
 | Dependency | Version | Notes |
 |---|---|---|
 | OS | - | macOS / Ubuntu 22.04+ / Windows (WSL2 recommended; Git Bash on native Windows) |
-| Python | 3.11+ (3.13 recommended) | auto-detected by `scripts/install_venv.sh` |
+| Python | 3.11+ (3.13 recommended) | auto-detected by `script/linux/install_venv.sh` |
 | PostgreSQL | 14+ | pgvector extension required (full mode, default) |
 | pgvector | 0.5+ | per-platform install: see "Installing and enabling pgvector" below |
 | SQLite (aiosqlite) | - | fallback mode, zero external deps: `[database] type = "sqlite"` |
@@ -60,9 +54,9 @@ weave-mem/
 The three scripts are self-contained and idempotent — the standard deployment is three steps:
 
 ```bash
-bash scripts/install_venv.sh   # idempotent: .venv + dependencies
-bash scripts/init_db.sh        # idempotent: createdb weave_mem + pgvector + tables
-bash scripts/start.sh          # start (auto-detect .venv)
+bash script/linux/install_venv.sh   # idempotent: .venv + dependencies
+bash script/linux/init_db.sh        # idempotent: createdb weave_mem + pgvector + tables
+bash script/linux/start.sh          # start (auto-detect .venv)
 curl http://127.0.0.1:8202/healthz
 ```
 
@@ -104,7 +98,7 @@ and the `.control`/`vector--*.sql` files into `share\extension\`.
 ### 2. Virtual Environment
 
 ```bash
-bash scripts/install_venv.sh
+bash script/linux/install_venv.sh
 ```
 
 Equivalent manual steps:
@@ -153,7 +147,7 @@ Supported environment variables:
 | `JWT_SECRET_KEY` | JWT secret (used when not set in config.toml) |
 | `CONFIG_MODEL_PATH` | config_model.toml path (defaults to config.toml's directory) |
 | `AGENT_MEMORY_DIR` | file-layer memory dir (default backend/agent_memories; auto-degrades if missing) |
-| `PGPASSWORD` | only used by `scripts/init_db.sh` when creating the database (the service itself does not read it) |
+| `PGPASSWORD` | only used by `script/linux/init_db.sh` when creating the database (the service itself does not read it) |
 
 > Model-related settings (`[api]`, `[defaults]`, `[providers]`, `[memory]`, ...) may be split into
 > a separate `config_model.toml` next to `config.toml` (or `CONFIG_MODEL_PATH`); it is merged
@@ -162,8 +156,8 @@ Supported environment variables:
 ### 4. Initialize, Start, Verify
 
 ```bash
-bash scripts/init_db.sh       # createdb weave_mem (idempotent) + enable pgvector + prebuild tables
-bash scripts/start.sh         # start (log weave-mem.log, PID weave-mem.pid)
+bash script/linux/init_db.sh       # createdb weave_mem (idempotent) + enable pgvector + prebuild tables
+bash script/linux/start.sh         # start (log weave-mem.log, PID weave-mem.pid)
 curl http://127.0.0.1:8202/healthz
 # expect: {"status":"ok","service":"weave-mem","database":"ok","pgvector":true}
 ```
@@ -182,7 +176,7 @@ curl http://127.0.0.1:8202/api/memory/status -H "Authorization: Bearer $TOKEN"
 ### 5. Stop
 
 ```bash
-bash scripts/stop.sh          # safe stop via PID file (won't kill unrelated processes)
+bash script/linux/stop.sh          # safe stop via PID file (won't kill unrelated processes)
 ```
 
 ## SQLite Fallback Mode (zero external dependencies)
@@ -203,7 +197,7 @@ path = "weave_mem.db"        # resolved relative to backend/
 | Auto-extraction / vector dedup / dream vectors | skipped (no vectors) | ✓ |
 | Deployment | zero external deps (aiosqlite) | PG + pgvector |
 
-`scripts/init_db.sh` auto-detects the type (SQLite skips PG). Switching back to PG is just a
+`script/linux/init_db.sh` auto-detects the type (SQLite skips PG). Switching back to PG is just a
 `type` change plus re-running init_db.sh. `/healthz` returns `"pgvector": false` under SQLite
 (expected degradation marker).
 
@@ -254,7 +248,7 @@ Endpoints: `POST /api/auth/tokens` (create), `GET /api/auth/tokens` (list), `DEL
 ## OpenAPI Spec
 
 - At runtime: `http://127.0.0.1:8202/docs` (Swagger UI) / `/openapi.json`
-- Frozen: `bash scripts/export_openapi.sh` → `docs/openapi.json` (30+ endpoints)
+- Frozen: `bash script/linux/export_openapi.sh` → `docs/openapi.json` (30+ endpoints)
 
 ## End-to-end Walkthrough
 
@@ -342,11 +336,13 @@ uses text matching.
 
 ## Testing
 
-9 acceptance suites (the service must be running first):
+13 acceptance suites (the service must be running first; `test_sqlite_mode` requires
+`[database] type="sqlite"` and is run separately):
 
 ```bash
 for t in test_api test_recall test_ingest_clarify test_clarify_apply test_blindspot \
-         test_full_chain test_pat test_mcp test_sqlite_mode; do
+         test_full_chain test_pat test_mcp test_sync_p0 test_adoption \
+         test_p2_gates test_recall_log; do
   ./.venv/bin/python tests/$t.py > tests/$t.log 2>&1 && echo "$t PASS" || echo "$t FAIL"
 done
 ```
@@ -362,6 +358,10 @@ done
 | test_pat.py | 8 items: PAT (create/list/auth/revoke/hash storage) |
 | test_mcp.py | 10 items: MCP server (HTTP thin forwarding + in-process verification) |
 | test_sqlite_mode.py | 13 items: SQLite fallback mode (healthz/concept chain/immediate recall/ingest 503/admin/GDPR) |
+| test_sync_p0.py | 19 items: no-key guards ×3 sites / resurrect decay-anchor / atomic weight + answer_cited / billing_class split / cluster embedding write path + backfill dry-run |
+| test_adoption.py | 17 items: POST /api/memory/adoption contract + write-back chain + edge cap + cross-modal consistency pure-fn 8 states |
+| test_p2_gates.py | 33 items: strategy routing / D1 edges+whitelist+P/L / D2 MMR+contradicts / D3 gray-zone+MST / E1+A4c / W8 link expansion |
+| test_recall_log.py | 16 items: ledger metadata-only + keyset pagination + dual-dialect cleanup + truncation note |
 
 ## FAQ
 
@@ -369,7 +369,7 @@ done
 
 ```bash
 psql -U postgres -h 127.0.0.1 -d weave_mem -c 'CREATE EXTENSION IF NOT EXISTS vector;'
-bash scripts/stop.sh; bash scripts/start.sh
+bash script/linux/stop.sh; bash script/linux/start.sh
 ```
 
 ### Changing `embedding_dim` after tables exist
@@ -401,6 +401,10 @@ real detection and auto-apply.
 
 The service does not crash: `embedding` stays empty on write, recall returns
 `"mode": "text"`; re-upsert concepts after the provider recovers to backfill vectors.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

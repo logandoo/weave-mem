@@ -488,7 +488,7 @@ async def _call_extraction_llm(
             "procedural 概念是'做某类任务的有效方法'，必须带触发条件。来源于 agent 自我观察/工作方法。procedural 免衰减。\n\n"
             + gate_hint +
             "输出 JSON 格式：\n"
-            '{"episodic": {"narrative": "<500 token 事件叙事>", "valid_from": "ISO8601或null", "merge_with_episode_id": "已有episode ID或null"}, '
+            '{"episodic": {"narrative": "<500 token 事件叙事>", "valid_from": "ISO8601或null", "merge_with_episode_id": "已有episode ID或null", "participants": ["人物名或空数组"], "locations": ["地名或空数组"]}, '
             '"concepts": [{"canonical_name": "...", "description_short": "≤80中文字", "description_full": "≤1000 token详版", '
             '"aliases": [...], "match_existing_id": "已有概念ID或null", "cluster_suggestion": "集合名", '
             '"source_trust": "user_stated|user_authored|agent_inferred", "memory_type": "semantic|episodic|procedural", '

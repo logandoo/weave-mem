@@ -39,7 +39,8 @@ class OpenAIAdapter:
     def get_client_kwargs(self) -> Dict[str, Any]:
         return {
             "base_url": self.config.base_url,
-            "api_key": self.config.api_key or config.api_key or "dummy-key",
+            # no-key 守卫（上游 a207ab59f）：显式端点空键 → "no-key" 占位，不回落全局 key
+            "api_key": self.config.api_key or ("no-key" if self.config.base_url else config.api_key or "dummy-key"),
         }
 
     def get_model_name(self) -> str:

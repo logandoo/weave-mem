@@ -51,12 +51,47 @@ def _get_embedding_api_key() -> str:
     key = config.memory.get("embedding_api_key", "")
     if key:
         return key
+    # no-key 守卫（上游 a207ab59f，2026-09-02）：显式配置的 embedding 端点
+    # （base_url 已填）空键 = 该服务不需要鉴权 → wire "no-key" 占位，
+    # 绝不回落全局 LLM key（否则主 key 会随 Authorization 发给第三方 embedding 服务）
+    if config.memory.get("embedding_api_base", ""):
+        return "no-key"
     return config.api_key or ""
 
 
 def _get_embedding_dim() -> int:
     # 新鲜 get_config()：SIGHUP reload 后模块级 config 是旧实例（A4.9 round5 复审 Minor #5）
-    return int(get_config().memory.get("embedding_dim", 1536))
+    cfg = get_config()
+    # A1（上游 3378f9907）：端点 extra.dim 优先——config.memory["embedding_dim"] 是
+    # 旧键（上游类型池重构后不存在），默认 1536 与 1024 维端点不符会让向量聚合恒空
+    ep = _embedding_endpoint()
+    if ep:
+        dim = (ep.get("extra") or {}).get("dim") or ep.get("dim")
+        if dim:
+            try:
+                return int(dim)
+            except (TypeError, ValueError):
+                pass
+    return int(cfg.memory.get("embedding_dim", 1536))
+
+
+def _get_embedding_model() -> str:
+    """DC2：embedding 溯源模型名（簇向量 provenance 落库用）。"""
+    ep = _embedding_endpoint()
+    if ep and ep.get("model_name"):
+        return str(ep["model_name"])
+    return str(config.memory.get("embedding_model", ""))
+
+
+def _embedding_endpoint():
+    """[endpoints.embedding] 形态端点（可选 dict）；无 model_gateway 时返回 None。"""
+    try:
+        cfg = get_config()
+        endpoints = (cfg._config.get("endpoints") or {})
+        ep = endpoints.get("embedding")
+        return ep if isinstance(ep, dict) else None
+    except Exception:
+        return None
 
 
 

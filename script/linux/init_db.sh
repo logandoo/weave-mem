@@ -5,13 +5,13 @@
 # PG 模式：1. 幂等创建 weave_mem 数据库 2. 幂等启用 vector 扩展
 #          3. 有 venv 时经 init_db 预建表（无 venv 跳过，服务首次启动自动建）
 #
-# 用法：bash scripts/init_db.sh
+# 用法：bash script/linux/init_db.sh
 # PG 参数可用环境变量覆盖：PGUSER / PGHOST / PGPORT / PGPASSWORD
 # 前置：本机已安装 PostgreSQL 14+ 与 pgvector 扩展包
 #      （分平台安装方式见 README "安装并启用 pgvector" 一节：macOS brew / Ubuntu 源码编译 / Windows 官方 build）
 set -euo pipefail
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FAMILY_DIR="$(dirname "$DIR")"
 
 # config 驱动方言（家族 wave4.1 模式）：type=sqlite 时免 PG。
@@ -74,7 +74,7 @@ else
 fi
 
 if [[ -z "$VENV_PYTHON" ]]; then
-  echo "  未找到 Python venv，跳过预建表（服务首次启动时自动创建；可先运行 scripts/install_venv.sh）"
+  echo "  未找到 Python venv，跳过预建表（服务首次启动时自动创建；可先运行 script/linux/install_venv.sh）"
 else
   if (cd "$DIR/backend" && "$VENV_PYTHON" -c \
       "import asyncio; from app.db.database import init_db; asyncio.run(init_db())"); then

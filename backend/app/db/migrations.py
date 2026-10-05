@@ -220,6 +220,33 @@ STARTUP_MIGRATIONS = [
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )"""),
     ("idx_mlc_user_ts", "CREATE INDEX IF NOT EXISTS idx_mlc_user_ts ON memory_llm_calls(user_id, created_at DESC)"),
+    # memory_llm_calls: 读写计费分离（上游 3378f9907 DC1，2026-09-14）——
+    # 'write'=写路径进降级计数；'read'=读路径遥测仅计费观测
+    ("mlc_billing_class", "ALTER TABLE memory_llm_calls ADD COLUMN IF NOT EXISTS billing_class VARCHAR(20) NOT NULL DEFAULT 'write'"),
+    # concept_relations: 边来源标记（上游 f5d2f6401 D1）——'llm'/'co_occurs'
+    ("cr_edge_source", "ALTER TABLE concept_relations ADD COLUMN IF NOT EXISTS edge_source VARCHAR(20) NOT NULL DEFAULT 'llm'"),
+    # memory_episodes: 参与者/地点（上游 f5d2f6401 D1 P/L/T，JSON 数组字符串）
+    ("me_participants", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS participants TEXT"),
+    ("me_locations", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS locations TEXT"),
+    # memory_clusters: 向量溯源模型（上游 3378f9907 DC2）
+    ("mc_cluster_embedding_model", "ALTER TABLE memory_clusters ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(100)"),
+    # memory_recall_log: C1 召回台账（仅元数据，上游 beda68eb4）
+    ("mrl_create", """CREATE TABLE IF NOT EXISTS memory_recall_log (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        conversation_id VARCHAR(36) REFERENCES conversations(id) ON DELETE CASCADE,
+        query_hash VARCHAR(64) NOT NULL,
+        candidate_ids TEXT,
+        tier_scores TEXT,
+        gate_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+        budget_chars INTEGER NOT NULL DEFAULT 0,
+        injected_chars INTEGER NOT NULL DEFAULT 0,
+        truncated BOOLEAN NOT NULL DEFAULT FALSE,
+        elapsed_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+        cache_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )"""),
+    ("mrl_idx_user_created", "CREATE INDEX IF NOT EXISTS mrl_idx_user_created ON memory_recall_log(user_id, created_at DESC)"),
 ]
 
 # §9.5 pgvector 缺失降级：启动探测结果（run_startup_migrations 期间更新）。

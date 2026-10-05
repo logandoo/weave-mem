@@ -298,6 +298,8 @@ class ConceptRelation(Base):
     relation_type = Column(String(50), nullable=False)
     description = Column(Text, nullable=True)
     weight = Column(Float, nullable=False, default=0.5)
+    # D1（上游 f5d2f6401）：边来源——'llm' 提取 / 'co_occurs' 确定性共现
+    edge_source = Column(String(20), nullable=False, default="llm", server_default="llm")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -343,6 +345,9 @@ class MemoryEpisode(Base):
     narrative = Column(Text, nullable=False)
     source_unit_ids = Column(Text, nullable=False)
     source_concept_ids = Column(Text, nullable=True)
+    # D1 P/L/T（上游 f5d2f6401）：参与者/地点（JSON 数组字符串，空串不落库）
+    participants = Column(Text, nullable=True)
+    locations = Column(Text, nullable=True)
     valid_from = Column(DateTime, default=datetime.utcnow)
     valid_to = Column(DateTime, nullable=True)
     superseded_by = Column(String(36), nullable=True)
@@ -363,8 +368,29 @@ class MemoryLLMCall(Base):
     model = Column(String(100), nullable=True)
     prompt_tokens = Column(Integer, nullable=False, default=0)
     completion_tokens = Column(Integer, nullable=False, default=0)
+    # DC1（上游 3378f9907）：读写分离——'write' 进降级计数，'read' 仅遥测
+    billing_class = Column(String(20), nullable=False, default="write", server_default="write")
     created_at = Column(DateTime, default=datetime.utcnow)
 
+
+
+class MemoryRecallLog(Base):
+    """C1 召回台账（仅元数据；上游 beda68eb4）——绝不存记忆内容。"""
+    __tablename__ = "memory_recall_log"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    conversation_id = Column(String(36), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=True)
+    query_hash = Column(String(64), nullable=False)
+    candidate_ids = Column(Text, nullable=True)
+    tier_scores = Column(Text, nullable=True)
+    gate_score = Column(Float, nullable=False, default=0.0)
+    budget_chars = Column(Integer, nullable=False, default=0)
+    injected_chars = Column(Integer, nullable=False, default=0)
+    truncated = Column(Boolean, nullable=False, default=False)
+    elapsed_ms = Column(Float, nullable=False, default=0.0)
+    cache_hit = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class Notebook(Base):

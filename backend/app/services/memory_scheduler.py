@@ -83,6 +83,7 @@ class MemoryScheduler:
     def __init__(self):
         self._subconscious_task: asyncio.Task | None = None
         self._consolidation_task: asyncio.Task | None = None
+        self._recall_cleanup_task: asyncio.Task | None = None
         self._running = False
 
     @property
@@ -97,18 +98,39 @@ class MemoryScheduler:
         self._running = True
         self._subconscious_task = asyncio.create_task(self._run_subconscious_scan_loop())
         self._consolidation_task = asyncio.create_task(self._run_consolidation_loop())
+        self._recall_cleanup_task = asyncio.create_task(self._run_recall_log_cleanup_loop())
         self._subconscious_task.add_done_callback(_task_done_callback(self, "subconscious"))
         self._consolidation_task.add_done_callback(_task_done_callback(self, "consolidation"))
+        self._recall_cleanup_task.add_done_callback(_task_done_callback(self, "recall_log_cleanup"))
         logger.info("MemoryScheduler: started (worker=%s)", _WORKER_ID)
 
     async def stop(self) -> None:
         self._running = False
-        for task in (self._subconscious_task, self._consolidation_task):
+        for task in (self._subconscious_task, self._consolidation_task, self._recall_cleanup_task):
             if task:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
         logger.info("MemoryScheduler: stopped")
+
+    async def _run_recall_log_cleanup_loop(self) -> None:
+        """C1 台账保留期清理（每 6h，静默失败；仅 touch memory_recall_log）。"""
+        while self._running:
+            try:
+                await asyncio.sleep(6 * 3600)
+                if not self._running:
+                    return
+                from app.db.database import AsyncSessionLocal
+                from app.services.memory_recall_log_service import cleanup_recall_log
+                async with AsyncSessionLocal() as db:
+                    res = await cleanup_recall_log(db)
+                    await db.commit()
+                if res.get("deleted"):
+                    logger.info("MemoryScheduler: recall log cleaned %s rows", res["deleted"])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("recall log cleanup failed (silent)", exc_info=True)
 
     async def _try_acquire_leader(self, db: AsyncSession) -> bool:
         try:

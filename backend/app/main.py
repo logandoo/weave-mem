@@ -113,7 +113,7 @@ async def _startup_tasks() -> None:
 
 
 async def _ensure_test_user() -> None:
-    """家族约定测试账号 test / 123456（scripts/smoke_test.sh 依赖）。"""
+    """家族约定测试账号 test / 123456（script/linux/smoke_test.sh 依赖）。"""
     from app.services.auth_service import hash_password
     async with AsyncSessionLocal() as db:
         user = (await db.execute(select(User).where(User.username == "test"))).scalar_one_or_none()
