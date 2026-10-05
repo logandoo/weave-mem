@@ -45,6 +45,14 @@ async def main() -> None:
         check("测试账号登录", r.status_code == 200, f"status={r.status_code}")
         h = {"Authorization": f"Bearer {r.json()['access_token']}"}
 
+        # 冷启动阈值夹具（bootstrap_threshold=10）：共享 test 账号在全新库上仅有
+        # 1 个概念会走冷启动回退（空上下文）→ recall 断言随库冷暖漂移（CI 红/本地绿）。
+        # 预热 6 条 filler 使 recallable>5 确定性走正常管线——断言本身不变。
+        for _i in range(6):
+            await c.post("/api/memory/concepts", headers=h, json={
+                "canonical_name": f"mcpfiller{suffix}_{_i}",
+                "description_short": "cold-start fixture", "importance": 0.1})
+
         async with streamable_http_client(MCP_URL) as streams:
             read, write = streams
             async with ClientSession(read, write) as session:

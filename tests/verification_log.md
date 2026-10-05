@@ -89,4 +89,4 @@
 - Baseline has 2 pre-existing failures → 已修复：Baseline 证据=GitHub CI 失败报告（weave-note run 37278411493 exit 127 旧脚本路径——并发会话已修绿）+ 本地 CI 预验 RED（sqlite 模式 test_sync_p0 TypeError datetime-str、test_recall_log GET 500 isoformat-str）；PG 12 套件基线绿
 - audit-evidence: 失败点定位（run_weight_decay:240 `now - created_at` str 相减 / memory.py:677 `.isoformat()` on str）+ 双言 SQL 直测复现（plain/keyset 查询 OK → 排除查询层）+ 修复后 sqlite 5/5 与 PG 12/12 对照
 - iter 1 PASS [C]: criteria 1-2（CI 三 job + 双言修复）| diagnosis: n/a — 根因=raw text() SQL 日期列 SQLite 回 str（PG 回 datetime）；修复 `_as_dt` 归一 + isoformat 双言兼容；ruff 硬核集 F401×3 归零（本 wave 早期文件未用导入）| changed: .github/workflows/ci.yml（新）/ memory_weight_service.py / api/memory.py / memory_recall_log_service.py（F401）| GREEN: sqlite 5/5 + PG 12/12 + scoped ruff CLEAN
-- iter 2 WIP [C]: criterion 3（推送+run 转绿）| diagnosis: n/a
+- iter 2 PASS [C]: criterion 3（推送+run 转绿）| diagnosis: n/a — 镜像推送 86b0cd1..f5117ba（8 文件，含 .github/workflows/ci.yml）；run 37301298125 三 job 全绿（lint scoped / sqlite 冒烟 5 套件 / pgvector 全量 12 套件），gh run watch --exit-status=0；weave-note run 37299913165 与 weave-talk run 37299888906 已由并发会话修复为 success（未重复动）
