@@ -36,6 +36,17 @@ def _set_mem(key: str, val) -> None:
     cfg._config.setdefault("memory", {})[key] = val
 
 
+def t0_as_dt() -> None:
+    """_as_dt 双言/带偏移/坏值四态（复审 M6 回归锚）。"""
+    from datetime import datetime as _dt
+    from app.services.memory_weight_service import _as_dt
+    check("_as_dt datetime 直通", _as_dt(_dt(2026, 1, 1)) == _dt(2026, 1, 1))
+    check("_as_dt SQLite 串→naive", _as_dt("2026-01-01 12:00:00.123456") == _dt(2026, 1, 1, 12, 0, 0, 123456))
+    check("_as_dt 带偏移剥 tz", _as_dt("2026-01-01T12:00:00+08:00") == _dt(2026, 1, 1, 12, 0, 0)
+          and _as_dt("2026-01-01T12:00:00Z") is not None)
+    check("_as_dt 坏值→None", _as_dt("not-a-date") is None and _as_dt(None) is None)
+
+
 async def t1_key_resolution() -> None:
     """F-1：显式 base + 空键 → wire no-key，绝不回落全局 LLM key。"""
     cfg = get_config()
@@ -338,6 +349,7 @@ async def t1_rmw_atomic() -> None:
 
 
 async def main() -> None:
+    t0_as_dt()
     await t1_key_resolution()
     await t2_resurrect_anchor()
     await t3_atomic_weight()

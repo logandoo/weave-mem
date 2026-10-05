@@ -38,8 +38,9 @@ jobs:
       - name: Start service (sqlite mode)
         run: |
           sed -i 's/^type = "postgres"/type = "sqlite"/' backend/config.toml
+          grep -q '^type = "sqlite"' backend/config.toml
           bash script/linux/start.sh
-          sleep 4
+          for i in $(seq 1 15); do curl -fsS http://127.0.0.1:8202/healthz && break; sleep 2; done
           curl -fsS http://127.0.0.1:8202/healthz
       - name: SQLite suites
         run: |
@@ -75,11 +76,13 @@ jobs:
           python-version: "3.12"
       - name: Install
         run: bash script/linux/install_venv.sh
+      - name: Install postgresql client (init_db + test_api admin step)
+        run: sudo apt-get update -q && sudo apt-get install -y -q postgresql-client
       - name: Init DB + start service
         run: |
           bash script/linux/init_db.sh
           bash script/linux/start.sh
-          sleep 4
+          for i in $(seq 1 15); do curl -fsS http://127.0.0.1:8202/healthz && break; sleep 2; done
           curl -fsS http://127.0.0.1:8202/healthz
       - name: Full acceptance suites
         run: |

@@ -45,13 +45,18 @@ async def main() -> None:
         check("测试账号登录", r.status_code == 200, f"status={r.status_code}")
         h = {"Authorization": f"Bearer {r.json()['access_token']}"}
 
-        # 冷启动阈值夹具（bootstrap_threshold=10）：共享 test 账号在全新库上仅有
-        # 1 个概念会走冷启动回退（空上下文）→ recall 断言随库冷暖漂移（CI 红/本地绿）。
-        # 预热 6 条 filler 使 recallable>5 确定性走正常管线——断言本身不变。
+        # 冷启动夹具：共享 test 账号在全新库上仅有 1 个概念会走冷启动回退链
+        # （_try_cold_start_fallback 对无摘要新用户返回空 ctx）→ recall 断言随库
+        # 冷暖漂移（CI 红/本地绿）。预热 6 条 filler 使 recallable>5 触发该链第 1 条
+        # 的 return None 确定性走正常管线——断言本身不变。用毕删除（账号持久）。
+        filler_ids = []
         for _i in range(6):
-            await c.post("/api/memory/concepts", headers=h, json={
+            _r = await c.post("/api/memory/concepts", headers=h, json={
                 "canonical_name": f"mcpfiller{suffix}_{_i}",
-                "description_short": "cold-start fixture", "importance": 0.1})
+                "description_short": "cold-start fixture"})
+            if _r.status_code in (200, 201):
+                filler_ids.append(_r.json().get("id"))
+        check("冷启动夹具预热 6 条", len(filler_ids) == 6, f"n={len(filler_ids)}")
 
         async with streamable_http_client(MCP_URL) as streams:
             read, write = streams
@@ -93,6 +98,10 @@ async def main() -> None:
                 check("MCP 与 HTTP 召回结构一致", http_body.get("mode") == "text"
                       and "context" in http_body and f"{kw}主题" in http_body.get("context", ""),
                       f"http_mode={http_body.get('mode')} http_hit={f'{kw}主题' in http_body.get('context', '')}")
+
+                # 夹具清理：filler 全数删除（持久库不留垃圾行）
+                for _fid in filler_ids:
+                    await c.delete(f"/api/memory/concepts/{_fid}", headers=h)
 
     print(f"\n==== 结果: {passed} passed, {failed} failed ====")
     sys.exit(0 if failed == 0 else 1)

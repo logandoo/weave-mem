@@ -187,13 +187,17 @@ async def apply_reinforcement_signal(db: AsyncSession, concept_id: str, signal_t
 
 def _as_dt(v):
     """raw SQL 日期列双言归一：SQLite 回 str（"YYYY-MM-DD HH:MM:SS[.ffffff]"），
-    PG 回 datetime——比较/做差前统一成 datetime（本地 tz-naive）。"""
+    PG 回 datetime——比较/做差前统一成 tz-naive datetime。
+
+    带偏移的 ISO 串（...Z / +08:00）解析后剥 tzinfo——本服务时间线全为
+    tz-naive UTC（utcnow 写入），保留 aware 会与 naive now 做差炸 TypeError。"""
     if v is None or isinstance(v, datetime):
         return v
     s = str(v).replace("T", " ")[:26]
     try:
-        return datetime.fromisoformat(s)
+        return datetime.fromisoformat(s).replace(tzinfo=None)
     except ValueError:
+        logger.debug("unparseable datetime row value: %r", v)
         return None
 
 
