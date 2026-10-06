@@ -20,3 +20,5 @@
 - ⛔ 镜像 rsync 必须 --exclude='.git/'（--delete 会连克隆仓的 .git 一起清掉）
 - ⛔ 公开仓推送剔除含会话文本摘录的过程件（gate_audit.md 类）——秘密扫描 clean ≠ 隐私 clean
 - ⛔ raw text() SQL 日期列双言陷阱：SQLite 回 str、PG 回 datetime——比较/做差/isoformat 前必须归一（本次 run_weight_decay 与 recall_log 端点同根双炸）
+- ⛔ openai SDK `base_url=None`/空串会静默回落 api.openai.com——无端点配置必须 fail-closed 短路，绝不可 `or None`（用户内容外泄级）
+- ⛔ pip 26 拒 requirements 文件内裸相对 `-e ../client`——可编辑安装走脚本绝对路径；改安装路径必须实测将执行的那条命令

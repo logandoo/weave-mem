@@ -6,3 +6,7 @@
 ## Round 2（scoped）
 C-5 五键裁决档 greps + 提交记录复核 → 见执行记录。
 Round 2 结果：C-5 裁决档/review_package/提交 a892c47/工作树 clean/migration_llm_timeout=120 — 5/5 PASS。**Fresh-verify: pass**
+
+# FCV — SDK 化 wave（2026-10-06）Fresh-verify: pass
+7/7：服务健康 / test_sdk 20+outbound 11 / 32 路径机器对账零缺口（root() 覆盖 GET /）/
+空 base fail-closed（无 base_url=None）/ MCP 单源 / 出向仅剩已注记 TEI rerank / ruff CLEAN。

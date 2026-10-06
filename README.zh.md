@@ -42,6 +42,7 @@ weave-mem/
 │   │   └── mcp_server.py   # MCP server（HTTP 薄转发）
 │   ├── config.toml         # infra + [memory] 全量配置（179 键）
 │   └── requirements.txt
+├── client/                 # weave-mem-client：类型化异步 SDK（pip install -e ./client）
 ├── script/linux/           # 全部脚本入口：start / stop / restart / project_build / install_venv / init_db / export_openapi
 ├── docs/
 │   └── openapi.json        # 固化 OpenAPI 规范（32 路径）
@@ -381,7 +382,8 @@ async with MemoryClient("http://127.0.0.1:8202", username="test", password="1234
 
 ```bash
 for t in test_api test_recall test_ingest_clarify test_clarify_apply test_blindspot \
-         test_full_chain test_pat test_mcp test_sqlite_mode; do
+         test_full_chain test_pat test_mcp test_sync_p0 test_adoption \
+         test_p2_gates test_recall_log test_sdk test_outbound_sdk; do
   ./.venv/bin/python tests/$t.py > tests/$t.log 2>&1 && echo "$t PASS" || echo "$t FAIL"
 done
 ```
@@ -396,6 +398,12 @@ done
 | test_full_chain.py | 13 项：整条记忆链（写入→详情→召回→摄入→自动提炼→召回命中） |
 | test_pat.py | 8 项：个人访问令牌（创建/列表/认证/撤销/哈希存储） |
 | test_mcp.py | 10 项：MCP server（HTTP 薄转发 + 进程内验证） |
+| test_sync_p0.py | 19+4 项：no-key 守卫×3 站点 / 复活衰减锚 / 原子权重+answer_cited / billing_class 读写分离 / 衰变守卫生产路径 / 簇 embedding 写路径+回填 dry-run |
+| test_adoption.py | 17 项：POST /api/memory/adoption 契约 + 写回链 + 边权封顶 + 一致性加权纯函数 8 态 |
+| test_p2_gates.py | 43 项：策略路由 / D1 边+白名单+P/L/T / D2 MMR+contradicts+AGPR 二跳 / D3 灰区+MST / E1+A4c / W8 链接扩展 / grouping 分组 |
+| test_recall_log.py | 16 项：台账仅元数据 + 复合 keyset 分页 + 双言清理 + 截断提示 |
+| test_sdk.py | 20 项：weave-mem-client SDK 端到端（32 路径含 root）+ 鉴权/自带头语义 |
+| test_outbound_sdk.py | 11 项：出向 embedding 走官方 SDK（stub 服务）含 no-key 哨兵 + 空配置 fail-closed |
 | test_sqlite_mode.py | 13 项：SQLite 降级模式（healthz/概念链/立即召回/ingest 503/admin/GDPR） |
 
 ## 常见问题

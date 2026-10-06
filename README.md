@@ -36,6 +36,7 @@ weave-mem/
 │   │   └── mcp_server.py   # MCP server (HTTP thin forwarder)
 │   ├── config.toml         # infra + [memory] full config (179 keys)
 │   └── requirements.txt
+├── client/                 # weave-mem-client: typed async SDK (pip install -e ./client)
 ├── script/linux/           # all entry points: start / stop / restart / project_build / install_venv / init_db / export_openapi
 ├── docs/
 │   └── openapi.json        # frozen OpenAPI spec (32 paths)
