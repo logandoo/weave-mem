@@ -12,52 +12,13 @@ http://127.0.0.1:8202，config [mcp] base_url 可覆盖），不直连服务层�
 """
 import logging
 
-import httpx
-
 from mcp.server import MCPServer
+from weave_mem_client import MemoryClient
 
 logger = logging.getLogger(__name__)
 
-
-class MemoryClient:
-    """weave-mem HTTP 薄客户端：登录缓存 token，所有工具调用走真实 HTTP。"""
-
-    def __init__(self, base_url: str, username: str = "", password: str = "", token: str = "",
-                 timeout: float = 60.0):
-        self.base_url = base_url.rstrip("/")
-        self.username = username
-        self.password = password
-        self.token = token
-        self.timeout = timeout
-        self._client = httpx.AsyncClient(timeout=timeout)
-        self._authenticated = False
-
-    async def ensure_auth(self) -> None:
-        if self._authenticated:
-            return
-        if self.token:
-            self._authenticated = True
-            return
-        if not self.username:
-            raise RuntimeError("MCP 认证未配置：config [mcp] 需 token 或 username/password")
-        resp = await self._client.post(
-            f"{self.base_url}/api/auth/login",
-            json={"username": self.username, "password": self.password},
-        )
-        resp.raise_for_status()
-        self.token = resp.json()["access_token"]
-        self._authenticated = True
-
-    async def request(self, method: str, path: str, **kwargs) -> dict:
-        await self.ensure_auth()
-        headers = {"Authorization": f"Bearer {self.token}"}
-        resp = await self._client.request(method, f"{self.base_url}{path}", headers=headers, **kwargs)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
-        return resp.json()
-
-    async def aclose(self) -> None:
-        await self._client.aclose()
+# MemoryClient 单源：发布包 weave-mem-client（client/）即 SDK——MCP 工具与
+# 外部调用方共用同一实现（旧时此处为私有拷贝，2026-10-05 SDK 化 wave 合一）。
 
 
 def create_mcp_server(base_url: str, username: str = "", password: str = "", token: str = "",

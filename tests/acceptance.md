@@ -1,7 +1,7 @@
-# Acceptance Criteria — GitHub CI 修复 wave（weave-mem 补 CI + SQLite 双言修复）
+# Acceptance Criteria — SDK 化 wave（weave-mem-client 发布包 + 出向 provider 归一）
 
 > cap=5  stall=3×
 
-1. weave-mem 补齐 GitHub Actions CI（对齐 note/talk 形态）：scoped lint（E9/F63/F7/F82/F841/F401 归零）+ sqlite 冒烟 5 套件 + PG 全量 12 套件三 job；推送后 run 转 success
-2. CI 预验揪出的 2 个 SQLite 双言 bug 修复并有回归覆盖：`run_weight_decay` raw 行日期 str 相减 TypeError（`_as_dt` 归一）、`GET /api/memory/recall_log` 的 `isoformat()` str 崩 500（双言兼容）；sqlite 模式 5 套件全绿、PG 12 套件无回归
-3. 全部 GitHub 仓 CI 状态核验：weave-mem 新 run 绿；weave-note/weave-talk 已绿（并发会话修复）不重复动；monorepo 本地留 CI 事实记录
+1. 发布型客户端包 `client/`（包名 `weave-mem-client`，pyproject 可安装）：类型化方法覆盖 openapi 全部 32 路径（鉴权/PAT/概念/召回/摄入/采纳/台账/澄清/治理/admin/healthz）；MCP 层 `MemoryClient` 单源复用包内实现（不再自带私有拷贝）；`tests/test_sdk.py` 经 SDK 端到端全绿
+2. 出向 provider 归一：embedding 两处（`memory_embedding_service` 主调用 + `provider_router.embedding_available` 探测）改走官方 `AsyncOpenAI` SDK，no-key 哨兵/超时/熔断降级语义逐条保留；`tests/test_outbound_sdk.py` 以 stub embeddings 服务实证（含 no-key 头语义）；rerank（TEI `/rerank` 无标准 SDK）保留 httpx 并注记定性
+3. 全量回归（PG 12+N 套件 + sqlite 口径）+ CI 全绿（lint 范围含 client 包、套件列表含新增两套件）+ A4.9 审查 + FCV + 文档（README 双语「调用方式/Client SDK」+ CHANGELOG）

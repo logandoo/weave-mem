@@ -2,6 +2,15 @@
 
 No version numbers during v0.x; entries are date-based. Format loosely follows Keep a Changelog.
 
+## 2026-10-05 — client SDK + outbound provider normalization
+
+### Added
+- `weave-mem-client` publishable typed async SDK (`client/`, pip-installable): 32 API paths 1:1, PAT/login auth, uniform `RuntimeError("HTTP …")` errors; the MCP `MemoryClient` now single-sources this package.
+
+### Changed
+- Outbound embedding calls (`memory_embedding_service` + `provider_router.embedding_available`) moved from hand-rolled httpx to the official `openai` SDK (no-key sentinel / timeout / circuit-breaker semantics preserved); TEI `/rerank` stays raw HTTP (no standard SDK for that contract).
+- README: `GET /api/memory/concepts` documented shape fixed (`{concepts, count}`, `limit` only).
+
 ## 2026-10-05 — leftover cleanup wave
 
 ### Added

@@ -93,3 +93,12 @@
 - iter 3 FAIL [C]: criterion 1-3（CI 首跑 pg-full 红）| diagnosis: test_mcp recall 断言随库冷暖漂移——共享 test 账号全新库仅 1 概念 < bootstrap_threshold=10 走冷启动回退（_fallback_context 对无摘要新用户返回空 ctx）→ hit=False；本地暖库 recallable>5 走正常管线总览段命中故绿（RED 证据 run 37301298125 日志 8 passed 2 failed）| changed: tests/test_mcp.py（夹具预热 6 条 filler，断言不变）
 - iter 4 PASS [C]: criteria 1-3（CI 全绿）| diagnosis: n/a — run 37302260042 三 job 全 ✓（lint 8s / pgvector 全量 12 套件 1m21s / sqlite 5 套件 49s），gh run watch --exit-status=0；三仓 CI 终态=weave-mem ✓ / weave-note ✓（run 37299913165，并发会话修复）/ weave-talk ✓（run 37299888906，并发会话修复）| changed: 推送 f5117ba..1f8de6c
 - docs-drift: CHANGELOG.md — 本波双言日期修复与 CI 新增使既有 2026-10-05 条目过期（已补记）
+- iter 5 PASS [C]: A4.9 scoped 复审 3 Important+3 Minor 修复 | diagnosis: n/a — I1 _as_dt 带偏移剥 tzinfo（aware/naive 做差 TypeError 隐患）+坏值 debug；I2 test_mcp 夹具改"创建即计数+用毕删除"（importance 参数原不被 API 读取——注释与行为对齐）+预热数断言（201 语义修正）；I3 CI 补 postgresql-client 显式安装；M4 healthz 重试+sed 断言；M6 _as_dt 四态单测；M1/M2/M5 具名遗留 | changed: memory_weight_service.py / tests/test_mcp.py / .github/workflows/ci.yml / tests/test_sync_p0.py | GREEN: 本地 7 套件 + CI run 37304141843 三 job 全 ✓
+- adjudicate (deferred): M1 recall_log created_at 双言格式差异（ISO T 分隔 vs 空格）——下触该文件时归一；M5 monorepo 内嵌 .github 为惰性（镜像推送模型 D-7 已声明）
+
+## Task: SDK 化 wave（weave-mem-client 发布包 + 出向 provider 归一） | 2026-10-05
+- class: CODE — 变更集=新 client/ 发布包 + services 出向归一 + MCP 单源 + 测试/CI/文档
+- Baseline verified GREEN — 12 套件基线绿（backup commit 含 "backup: before changes"）
+- iter 1 FAIL [C]: criteria 1-2（RED）| diagnosis: weave_mem_client 包缺位 ModuleNotFoundError；出向 stub 实证 UA=python-httpx/0.28.1（手拼 httpx 实锤）且探测配置面误设 embedding_*（探针读主 provider [api]）——test 夹具修正后 RED 定格 2 FAIL（UA×2）+ 7 PASS（语义=重构保真锚）| changed: tests/test_sdk.py + tests/test_outbound_sdk.py（RED 留痕见 logs）
+- iter 2 PASS [C]: criteria 1-2（实现）| diagnosis: n/a — client/ 包（32 路径 1:1、匿名透传 401、错误统一 RuntimeError）+ mcp_server MemoryClient 单源（-e ../client 入 requirements）+ embedding 两处 AsyncOpenAI 归一（(base,key) 缓存失效保 reload 语义）+ rerank 定性注记（TEI 无标准 SDK）| changed: client/pyproject.toml + weave_mem_client/{__init__,client}.py / mcp_server.py / memory_embedding_service.py / provider_router.py / memory_retrieval_service.py / requirements.txt | GREEN: test_sdk 18/18 + test_outbound_sdk 9/9（UA=OpenAI、no-key、探测 dim=4）
+- iter 3 WIP [C]: criterion 3（回归/CI/审查/FCV）| diagnosis: n/a

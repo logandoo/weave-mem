@@ -305,7 +305,7 @@ curl -sS -X DELETE http://127.0.0.1:8202/api/memory/all -H "Authorization: Beare
 | GET | `/api/auth/tokens` | PAT 列表 |
 | DELETE | `/api/auth/tokens/{id}` | 撤销 PAT |
 | GET | `/api/memory/status` | pgvector/维度/数量统计 |
-| GET | `/api/memory/concepts` | 概念列表（支持 `q`、`limit`） |
+| GET | `/api/memory/concepts` | 概念列表（`limit`；返回 `{concepts, count}`） |
 | POST | `/api/memory/concepts` | 新建/更新概念（同名 upsert） |
 | GET | `/api/memory/concepts/{id}` | 概念详情 |
 | DELETE | `/api/memory/concepts/{id}` | 删除概念 |
@@ -350,6 +350,29 @@ curl -sS -X POST http://127.0.0.1:8202/api/memory/concepts \
 未传 `embedding` 且配置了 `embedding_api_base` 时，服务会调用
 `POST {embedding_api_base}/embeddings` 自动向量化；未配置时
 `embedding` 为 NULL，recall 使用文本匹配。
+
+## 客户端 SDK（`weave-mem-client`）
+
+`client/` 目录发布类型化异步 SDK，覆盖全部 32 条 API 路径——与 MCP 层共用同一个
+`MemoryClient`（单源）。安装与调用：
+
+```bash
+pip install -e ./client        # 仓库根目录执行；或 pip install <repo>/client
+```
+
+```python
+from weave_mem_client import MemoryClient
+
+async with MemoryClient("http://127.0.0.1:8202", username="test", password="123456") as c:
+    concept = await c.create_concept(canonical_name="weave-family", description_short="服务家族")
+    rec = await c.recall(query="weave-family", include_meta=True)   # rec["meta"]["memory_ids"]
+    ledger = await c.recall_log(limit=10)                            # 仅元数据
+```
+
+鉴权三态：构造传 PAT（`token=`，推荐）；或 `username`/`password`（首调自动登录并缓存）；
+或直接 `request(method, path)` 自带头。错误统一抛 `RuntimeError("HTTP <code>: …")`；
+未带凭据的调用透传给服务端 401。服务自身的出向 provider 调用（LLM 与 embedding）走
+官方 `openai` SDK；TEI `/rerank` 保留裸 HTTP（该契约无标准 SDK）。
 
 ## 测试
 

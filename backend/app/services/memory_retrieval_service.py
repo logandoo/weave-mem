@@ -1701,6 +1701,8 @@ async def _stage4_cross_encoder(
             docs.append(c.content[:256])
     if not docs:
         return ordered
+    # 出向定性（2026-10-05 SDK 归一波）：TEI/Xinference /rerank 无官方标准 SDK
+    # （裸 HTTP 契约），此处保留 httpx 手调——非"绕开 SDK"，是无 SDK 可用。
     headers = {"Content-Type": "application/json"}
     api_key = config.memory.get("rerank_api_key") or ""
     if api_key:

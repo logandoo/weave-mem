@@ -191,7 +191,8 @@ class ProviderRouter:
 
         404/网络异常/非法响应 → (False, None)；成功 → (True, embedding 维度)。
         """
-        import httpx
+        # 2026-10-05 出向归一：走官方 openai SDK（原手拼 httpx）
+        from openai import AsyncOpenAI
         kwargs = self.get_client_kwargs(provider_name)
         base_url = str(kwargs.get("base_url", "") or "").rstrip("/")
         api_key = str(kwargs.get("api_key", "") or "")
@@ -199,17 +200,10 @@ class ProviderRouter:
             return False, None
         model = config.memory.get("embedding_model", "text-embedding-3-small")
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-                resp = await client.post(
-                    f"{base_url}/embeddings",
-                    headers={"Authorization": f"Bearer {api_key}",
-                             "Content-Type": "application/json"},
-                    json={"input": "probe", "model": model},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                emb = data["data"][0]["embedding"]
-                return True, len(emb)
+            async with AsyncOpenAI(base_url=base_url, api_key=api_key or "dummy-key-for-header",
+                                   timeout=15.0, max_retries=0) as client:
+                resp = await client.embeddings.create(input="probe", model=model)
+                return True, len(resp.data[0].embedding)
         except Exception:
             return False, None
 

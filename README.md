@@ -304,7 +304,7 @@ curl -sS -X DELETE http://127.0.0.1:8202/api/memory/all -H "Authorization: Beare
 | GET | `/api/auth/tokens` | list PATs |
 | DELETE | `/api/auth/tokens/{id}` | revoke PAT |
 | GET | `/api/memory/status` | pgvector/dimension/count stats |
-| GET | `/api/memory/concepts` | concept list (supports `q`, `limit`) |
+| GET | `/api/memory/concepts` | concept list (supports `limit`; returns `{concepts, count}`) |
 | POST | `/api/memory/concepts` | create/update concept (same-name upsert) |
 | GET | `/api/memory/concepts/{id}` | concept detail |
 | DELETE | `/api/memory/concepts/{id}` | delete concept |
@@ -349,6 +349,30 @@ curl -sS -X POST http://127.0.0.1:8202/api/memory/concepts \
 When `embedding` is omitted and `embedding_api_base` is configured, the service auto-vectorizes
 via `POST {embedding_api_base}/embeddings`; when unconfigured, `embedding` stays NULL and recall
 uses text matching.
+
+## Client SDK (`weave-mem-client`)
+
+The `client/` directory ships a typed async SDK covering all 32 API paths — the same
+`MemoryClient` the MCP layer uses (single source). Install and call:
+
+```bash
+pip install -e ./client        # from the repo root; or pip install <repo>/client
+```
+
+```python
+from weave_mem_client import MemoryClient
+
+async with MemoryClient("http://127.0.0.1:8202", username="test", password="123456") as c:
+    concept = await c.create_concept(canonical_name="weave-family", description_short="a family of services")
+    rec = await c.recall(query="weave-family", include_meta=True)   # rec["meta"]["memory_ids"]
+    ledger = await c.recall_log(limit=10)                            # metadata-only
+```
+
+Auth: pass a PAT as `token=` (recommended), or `username`/`password` (auto-login, cached),
+or call `request(method, path)` directly. Errors raise `RuntimeError("HTTP <code>: …")`;
+an unauthenticated call surfaces the server's 401. Outbound provider calls from the service
+itself use the official `openai` SDK (LLM + embeddings); the TEI `/rerank` call stays raw
+HTTP because no standard SDK exists for that contract.
 
 ## Testing
 

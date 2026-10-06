@@ -20,8 +20,10 @@ _embedding_cache_max_size = 100
 # 并发控制：全局最多 10 个并发 embedding 请求
 _embed_semaphore = asyncio.Semaphore(10)
 
-# 共享 httpx 客户端（连接池复用）
-_http_client: httpx.AsyncClient | None = None
+# 共享官方 SDK 客户端（AsyncOpenAI；2026-10-05 出向归一——手拼 httpx 退场）
+# 按 (base_url, api_key) 缓存：reload-config / 端点切换即重建（保旧版逐调新鲜语义）
+_sdk_client = None
+_sdk_cache_key: tuple = ()
 
 # 熔断器
 _circuit_failures: int = 0
@@ -30,14 +32,26 @@ _CIRCUIT_FAIL_THRESHOLD = 3
 _CIRCUIT_COOLDOWN_SECONDS = 60
 
 
-def _get_client() -> httpx.AsyncClient:
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(
+def _get_client():
+    """出向 embedding 客户端 = 官方 openai SDK（与 llm_service 同 SDK 同语义）。
+
+    base_url 为空时回落主端点（config.api_base_url）；api_key 空且显式 base
+    时为 "no-key" 哨兵（a207ab59f 语义，SDK 原样发该头）。
+    """
+    global _sdk_client, _sdk_cache_key
+    base = _get_embedding_api_base() or None
+    key = _get_embedding_api_key() or "dummy-key-for-header"
+    cache_key = (base, key)
+    if _sdk_client is None or _sdk_cache_key != cache_key:
+        from openai import AsyncOpenAI
+        _sdk_client = AsyncOpenAI(
+            base_url=base,
+            api_key=key,
             timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
-            limits=httpx.Limits(max_connections=15, max_keepalive_connections=10),
+            max_retries=0,
         )
-    return _http_client
+        _sdk_cache_key = cache_key
+    return _sdk_client
 
 
 def _get_embedding_api_base() -> str:
@@ -105,19 +119,11 @@ async def _do_embed(text: str) -> Optional[list[float]]:
         _circuit_failures = 0
 
     model = config.memory.get("embedding_model", "text-embedding-3-small")
-    api_key = _get_embedding_api_key()
-    base_url = _get_embedding_api_base()
     client = _get_client()
 
     try:
-        resp = await client.post(
-            f"{base_url}/embeddings",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"input": text, "model": model},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        emb = data["data"][0]["embedding"]
+        resp = await client.embeddings.create(input=text, model=model)
+        emb = resp.data[0].embedding
         _circuit_failures = 0
         return emb
     except Exception:
