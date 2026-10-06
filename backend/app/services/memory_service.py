@@ -62,26 +62,40 @@ def _build_fallback_dream_summary(notes: List[Note], messages: List[Message]) ->
     )
 
 
-async def ensure_user_agent_state(db: AsyncSession, user_id: str) -> UserAgentState:
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
+async def ensure_user_agent_state(db: AsyncSession, user_id: str, agent_id: str | None = None) -> UserAgentState:
+    """get-or-create per (user, agent) 状态行（Wave 1；agent_id=None 为共享行）。
 
-    result = await db.execute(select(UserAgentState).where(UserAgentState.user_id == user_id))
-    state = result.scalar_one_or_none()
+    唯一性由迁移表达式索引 ON (user_id, COALESCE(agent_id,'')) 保证；并发插入
+    用 SAVEPOINT + IntegrityError 重试（跨 PG/SQLite，且兼容老 SQLite 库残留的
+    unique(user_id) 约束——那种库上多 agent 行会降级为无状态行，但作用域不受影响）。
+    """
+    from sqlalchemy.exc import IntegrityError
+    import uuid as _uuid
+
+    async def _select():
+        result = await db.execute(select(UserAgentState).where(
+            UserAgentState.user_id == user_id,
+            UserAgentState.agent_id == agent_id,
+        ))
+        return result.scalar_one_or_none()
+
+    state = await _select()
     if state is not None:
         return state
 
-    stmt = (
-        pg_insert(UserAgentState)
-        .values(user_id=user_id, agent_name=config.agent_name)
-        .on_conflict_do_nothing(index_elements=["user_id"])
-    )
-    await db.execute(stmt)
-    await db.commit()
+    agent_name = agent_id[:120] if agent_id else config.agent_name
+    try:
+        async with db.begin_nested():
+            db.add(UserAgentState(id=str(_uuid.uuid4()), user_id=user_id, agent_id=agent_id,
+                                  agent_name=agent_name))
+            await db.flush()
+    except IntegrityError:
+        pass
 
-    result = await db.execute(select(UserAgentState).where(UserAgentState.user_id == user_id))
-    state = result.scalar_one_or_none()
+    state = await _select()
     if state is None:
-        raise RuntimeError(f"Failed to create UserAgentState for user {user_id}")
+        raise RuntimeError(f"Failed to create UserAgentState for user {user_id} agent {agent_id}")
+    await db.commit()
     return state
 
 

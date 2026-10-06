@@ -66,7 +66,7 @@ async def record_llm_call_bg(
 
 async def _load_level(db: AsyncSession, user_id: str) -> int:
     result = await db.execute(
-        text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid"),
+        text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL"),
         {"uid": user_id},
     )
     raw = result.scalar()
@@ -81,7 +81,7 @@ async def _load_level(db: AsyncSession, user_id: str) -> int:
 
 async def _save_level(db: AsyncSession, user_id: str, level: int, reason: str = "") -> None:
     result = await db.execute(
-        text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid"
+        text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL"
          + (" FOR UPDATE" if not _IS_SQLITE_CM() else "")),
         {"uid": user_id},
     )
@@ -96,7 +96,7 @@ async def _save_level(db: AsyncSession, user_id: str, level: int, reason: str = 
         "updated_at": datetime.utcnow().isoformat(),
     }
     await db.execute(
-        text("UPDATE user_agent_states SET metadata_json = :meta WHERE user_id = :uid"),
+        text("UPDATE user_agent_states SET metadata_json = :meta WHERE user_id = :uid AND agent_id IS NULL"),
         {"meta": json.dumps(meta, ensure_ascii=False), "uid": user_id},
     )
     _user_degrade_state[user_id] = level
@@ -153,7 +153,7 @@ async def check_user_threshold_and_degrade(db: AsyncSession, user_id: str) -> in
         old_reason = ""
         try:
             raw = (await db.execute(
-                text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid"),
+                text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL"),
                 {"uid": user_id})).scalar()
             meta = json.loads(raw) if raw else {}
             old_reason = (meta.get("cost_governance") or {}).get("reason") or ""
@@ -195,7 +195,7 @@ async def get_user_degrade_status(db: AsyncSession, user_id: str) -> dict:
     _user_degrade_state[user_id] = level
 
     result = await db.execute(
-        text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid"),
+        text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL"),
         {"uid": user_id},
     )
     raw = result.scalar()

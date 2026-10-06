@@ -18,6 +18,7 @@ async def create_episode(
     db: AsyncSession, user_id: str, narrative: str, valid_from: datetime,
     source_unit_ids: list[str], source_concept_ids: list[str] | None = None,
     participants: str | None = None, locations: str | None = None,
+    agent_id: str | None = None,
 ) -> str:
     eid = str(uuid.uuid4())
     narr = narrative[:5000]
@@ -26,6 +27,7 @@ async def create_episode(
     episode = MemoryEpisode(
         id=eid,
         user_id=user_id,
+        agent_id=agent_id,
         narrative=narr,
         source_unit_ids=json.dumps(source_unit_ids, ensure_ascii=False),
         source_concept_ids=json.dumps(source_concept_ids or [], ensure_ascii=False),
@@ -69,6 +71,7 @@ async def merge_first(
     db: AsyncSession, user_id: str, narrative: str,
     source_unit_ids: list[str],
     participants: str | None = None, locations: str | None = None,
+    agent_id: str | None = None,
 ) -> Optional[str]:
     threshold = float(config.memory_episodic.get("merge_first_threshold", 0.85))
     emb = await embed_text(narrative)
@@ -76,7 +79,7 @@ async def merge_first(
         return None
 
     from app.services.memory_embedding_service import find_similar_episodes
-    candidates = await find_similar_episodes(db, user_id, emb, top_k=1)
+    candidates = await find_similar_episodes(db, user_id, emb, top_k=1, agent_id=agent_id)
     if candidates and candidates[0]["similarity"] >= threshold:
         existing_id = candidates[0]["id"]
         await merge_episode(db, existing_id, narrative, source_unit_ids,

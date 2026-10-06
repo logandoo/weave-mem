@@ -67,7 +67,7 @@ _SYNC_INTERVAL_HOURS = 20
 
 async def _last_sync_at(db: AsyncSession, user_id: str) -> float:
     result = await db.execute(
-        text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid"),
+        text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL"),
         {"uid": user_id},
     )
     raw = result.scalar()
@@ -82,7 +82,7 @@ async def _last_sync_at(db: AsyncSession, user_id: str) -> float:
 async def _mark_synced(db: AsyncSession, user_id: str) -> None:
     import time as _t
     result = await db.execute(
-        text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid"
+        text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL"
          + (" FOR UPDATE" if not _IS_SQLITE_CM() else "")),
         {"uid": user_id},
     )
@@ -93,7 +93,7 @@ async def _mark_synced(db: AsyncSession, user_id: str) -> None:
         meta = {}
     meta["last_profile_sync_at"] = _t.time()
     await db.execute(
-        text("UPDATE user_agent_states SET metadata_json = :meta WHERE user_id = :uid"),
+        text("UPDATE user_agent_states SET metadata_json = :meta WHERE user_id = :uid AND agent_id IS NULL"),
         {"meta": json.dumps(meta, ensure_ascii=False), "uid": user_id},
     )
 
@@ -103,7 +103,7 @@ async def _load_recent_summaries(db: AsyncSession, user_id: str, limit: int = 10
     result = await db.execute(
         text("""
             SELECT content FROM agent_memories
-            WHERE agent_state_id = (SELECT id FROM user_agent_states WHERE user_id = :uid)
+            WHERE agent_state_id = (SELECT id FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL)
               AND source_type = 'daily-summary' AND content IS NOT NULL
               AND created_at >= :since
             ORDER BY created_at DESC LIMIT :lim
@@ -255,16 +255,18 @@ async def sync_profile_concepts(db: AsyncSession, user_id: str, force: bool = Fa
     return {"created": created, "updated": updated, "skipped": skipped}
 
 
-async def get_profile_concepts(db: AsyncSession, user_id: str, limit: int = 6) -> list[dict]:
+async def get_profile_concepts(db: AsyncSession, user_id: str, limit: int = 6,
+                               agent_id: str | None = None) -> list[dict]:
     """读路径：profile 概念（active，权重降序）。"""
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     result = await db.execute(
-        text("""
+        text(f"""
             SELECT canonical_name, description_short FROM memory_concepts
             WHERE user_id = :uid AND memory_type = 'profile'
-              AND status = 'active' AND valid_to IS NULL
+              AND status = 'active' AND valid_to IS NULL {agent_scope_sql(agent_id)}
             ORDER BY weight DESC, created_at DESC LIMIT :lim
         """),
-        {"uid": user_id, "lim": limit},
+        {"uid": user_id, "lim": limit, **agent_scope_params(agent_id)},
     )
     return [
         {"name": r[0], "desc": r[1]}

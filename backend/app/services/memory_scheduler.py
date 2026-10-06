@@ -37,9 +37,9 @@ async def _unlock(db, lock_id: int) -> None:
 _LEADER_LOCK_ID = 0x4D454D4F5259
 
 
-def _user_lock_id(user_id: str) -> int:
-    """跨进程稳定的 per-user advisory lock id（Python hash() 按进程随机化，不可用）。"""
-    return zlib.crc32(f"mem_user_{user_id}".encode("utf-8")) % (2**31)
+def _user_lock_id(user_id: str, agent_id: str | None = None) -> int:
+    """跨进程稳定的 per-(user,agent) advisory lock id（Python hash() 按进程随机化，不可用）。"""
+    return zlib.crc32(f"mem_user_{user_id}:{agent_id or chr(0)}".encode("utf-8")) % (2**31)
 
 
 def _get_memory_tz() -> ZoneInfo:
@@ -195,15 +195,15 @@ class MemoryScheduler:
                 return
             skipped = 0
             try:
-                active_users = await self._get_active_users(db)
-                for user_id in active_users:
+                active_scopes = await self._get_active_scopes(db)
+                for user_id, agent_id in active_scopes:
                     try:
-                        if not await _try_lock(db, _user_lock_id(user_id)):
+                        if not await _try_lock(db, _user_lock_id(user_id, agent_id)):
                             skipped += 1
                             continue
                         try:
                             await asyncio.wait_for(
-                                self._run_subconscious_for_user(db, user_id),
+                                self._run_subconscious_for_user(db, user_id, agent_id),
                                 timeout=120,
                             )
                         finally:
@@ -214,7 +214,7 @@ class MemoryScheduler:
                             except Exception:
                                 logger.exception("MemoryScheduler: rollback failed for user=%s", user_id)
                             try:
-                                await _unlock(db, _user_lock_id(user_id))
+                                await _unlock(db, _user_lock_id(user_id, agent_id))
                                 await db.commit()
                             except Exception:
                                 logger.exception("MemoryScheduler: failed to release user lock for %s (auto-cleaned on pool return)", user_id)
@@ -224,16 +224,19 @@ class MemoryScheduler:
                         logger.exception("MemoryScheduler: user %s scan failed", user_id)
             finally:
                 await self._release_leader(db)
-            logger.info("MemoryScheduler: scan cycle done users=%d skipped_locked=%d", len(active_users), skipped)
+            logger.info("MemoryScheduler: scan cycle done scopes=%d skipped_locked=%d", len(active_scopes), skipped)
 
-    async def _run_subconscious_for_user(self, db: AsyncSession, user_id: str) -> None:
+    async def _run_subconscious_for_user(self, db: AsyncSession, user_id: str,
+                                          agent_id: str | None = None) -> None:
         from app.services.memory_subconscious_service import (
             archive_soft_deprecated,
             ingest_pending_raw_units,
             scan_recurrence,
         )
-        await ingest_pending_raw_units(db, user_id)
-        await db.commit()
+        # 旧笔记/消息水位线扫描仅共享作用域跑一次（来源无 agent 归属）
+        if agent_id is None:
+            await ingest_pending_raw_units(db, user_id)
+            await db.commit()
         # §9.10 降级链最重档 subconscious_off：新 raw 仅入存档，暂停 recurrence 扫描升级
         try:
             from app.services.memory_cost_governance_service import is_step_enabled
@@ -241,8 +244,10 @@ class MemoryScheduler:
         except Exception:
             sub_enabled = True
         if sub_enabled and config.memory.get("recurrence_trigger_enabled", True):
-            await scan_recurrence(db, user_id)
+            await scan_recurrence(db, user_id, agent_id)
             await db.commit()
+        if agent_id is not None:
+            return  # 归档/画像同步为用户级（共享作用域跑一次）
         try:
             await archive_soft_deprecated(db, user_id)
             await db.commit()
@@ -311,9 +316,11 @@ class MemoryScheduler:
             skipped = 0
             processed = 0
             try:
-                active_users = await self._get_active_users(db)
-                # §9.10：计费自动降级每日检查（先于 consolidation，降级用户跳过贵操作）
-                for user_id in active_users:
+                active_scopes = await self._get_active_scopes(db)
+                # §9.10：计费自动降级每日检查（用户级，仅共享作用域跑一次）
+                for user_id, agent_id in active_scopes:
+                    if agent_id is not None:
+                        continue
                     try:
                         from app.services.memory_cost_governance_service import check_user_threshold_and_degrade
                         await asyncio.wait_for(
@@ -325,14 +332,14 @@ class MemoryScheduler:
                     except Exception:
                         logger.debug("cost governance check failed for %s", user_id, exc_info=True)
                         await db.rollback()
-                for user_id in active_users:
+                for user_id, agent_id in active_scopes:
                     try:
-                        if not await _try_lock(db, _user_lock_id(user_id)):
+                        if not await _try_lock(db, _user_lock_id(user_id, agent_id)):
                             skipped += 1
                             continue
                         try:
                             await asyncio.wait_for(
-                                self._run_consolidation_for_user(db, user_id),
+                                self._run_consolidation_for_user(db, user_id, agent_id),
                                 timeout=300,
                             )
                             processed += 1
@@ -342,7 +349,7 @@ class MemoryScheduler:
                             except Exception:
                                 logger.exception("MemoryScheduler: consolidation rollback failed for %s", user_id)
                             try:
-                                await _unlock(db, _user_lock_id(user_id))
+                                await _unlock(db, _user_lock_id(user_id, agent_id))
                                 await db.commit()
                             except Exception:
                                 logger.exception("MemoryScheduler: failed to release consolidation lock for %s (auto-cleaned on pool return)", user_id)
@@ -352,18 +359,24 @@ class MemoryScheduler:
                         logger.exception("MemoryScheduler: user %s consolidation failed", user_id)
             finally:
                 await self._release_leader(db)
-            logger.info("MemoryScheduler: consolidation cycle done users=%d processed=%d skipped_locked=%d", len(active_users), processed, skipped)
+            logger.info("MemoryScheduler: consolidation cycle done scopes=%d processed=%d skipped_locked=%d", len(active_scopes), processed, skipped)
             return True, processed
 
-    async def _run_consolidation_for_user(self, db: AsyncSession, user_id: str) -> None:
+    async def _run_consolidation_for_user(self, db: AsyncSession, user_id: str,
+                                          agent_id: str | None = None) -> None:
         from app.services.memory_consolidation_service import run_consolidation
-        await run_consolidation(db, user_id)
+        await run_consolidation(db, user_id, agent_id)
 
-    async def _get_active_users(self, db: AsyncSession) -> list[str]:
+    async def _get_active_scopes(self, db: AsyncSession) -> list[tuple[str, str | None]]:
+        """Wave 1：活跃 (user, agent) 对（无状态行用户回退 (uid, None)）。"""
         result = await db.execute(
-            text("SELECT id FROM users WHERE is_active = TRUE ORDER BY (last_login_at IS NULL), last_login_at DESC LIMIT 200")
+            text("""SELECT u.id, s.agent_id FROM users u
+                    LEFT JOIN user_agent_states s ON s.user_id = u.id
+                    WHERE u.is_active = TRUE
+                    ORDER BY (u.last_login_at IS NULL), u.last_login_at DESC, (s.agent_id IS NULL) DESC, s.agent_id
+                    LIMIT 500""")
         )
-        return [row[0] for row in result.fetchall()]
+        return [(row[0], row[1]) for row in result.fetchall()]
 
 
 memory_scheduler = MemoryScheduler()

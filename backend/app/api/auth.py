@@ -86,9 +86,19 @@ async def login(request: Request, login_req: LoginRequest, db: AsyncSession = De
     user.last_login_ip = request.client.host if request.client else None
     await db.commit()
 
+    agent_id = None
+    if login_req.agent_id is not None:
+        from app.services.memory_scope import normalize_agent_id, ensure_agent_registered
+        try:
+            agent_id = normalize_agent_id(login_req.agent_id)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="invalid agent_id (allowed: [A-Za-z0-9._-]{1,64})")
+        if agent_id:
+            await ensure_agent_registered(user.id, agent_id)
+
     await ensure_user_agent_state(db, user.id)
 
-    access_token = create_access_token(user.id, user.username)
+    access_token = create_access_token(user.id, user.username, agent_id=agent_id)
 
     user_agent = request.headers.get("user-agent", "")
 
@@ -125,13 +135,25 @@ async def create_pat_token(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """创建个人访问令牌（PAT）：明文仅本次响应返回，之后不可再查（memos 借鉴）。"""
+    """创建个人访问令牌（PAT）：明文仅本次响应返回，之后不可再查（memos 借鉴）。
+
+    Wave 1：可选 body.agent_id 绑定作用域（此后该 token 免 header 即为该 agent）。
+    """
     body = body or {}
     name = str(body.get("name") or "").strip()[:100]
+    agent_id = None
+    if body.get("agent_id") is not None:
+        from app.services.memory_scope import normalize_agent_id, ensure_agent_registered
+        try:
+            agent_id = normalize_agent_id(body.get("agent_id"))
+        except ValueError:
+            raise HTTPException(status_code=422, detail="invalid agent_id (allowed: [A-Za-z0-9._-]{1,64})")
+        if agent_id:
+            await ensure_agent_registered(current_user.id, agent_id)
     from app.services.auth_service import create_pat
-    tid, plain = await create_pat(db, current_user.id, name)
+    tid, plain = await create_pat(db, current_user.id, name, agent_id=agent_id)
     await db.commit()
-    return {"id": tid, "name": name, "token": plain, "token_type": "bearer"}
+    return {"id": tid, "name": name, "agent_id": agent_id, "token": plain, "token_type": "bearer"}
 
 
 @router.get("/tokens")
@@ -147,7 +169,7 @@ async def list_pat_tokens(
         .order_by(PersonalAccessToken.created_at.desc())
     )
     return [
-        {"id": t.id, "name": t.name,
+        {"id": t.id, "name": t.name, "agent_id": t.agent_id,
          "created_at": str(t.created_at) if t.created_at else None,
          "last_used_at": str(t.last_used_at) if t.last_used_at else None,
          "revoked": t.revoked_at is not None}

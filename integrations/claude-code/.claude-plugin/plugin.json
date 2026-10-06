@@ -1,0 +1,8 @@
+{
+  "name": "weave-mem",
+  "description": "Automatic long-term memory for Claude Code backed by weave-mem: auto-recall before every prompt, incremental capture after every response (agent scope: claude-code).",
+  "version": "0.1.0",
+  "author": {
+    "name": "weave-family"
+  }
+}

@@ -16,12 +16,14 @@ class MemoryClient:
     """weave-mem 异步客户端（可作 async context manager）。"""
 
     def __init__(self, base_url: str, username: str = "", password: str = "", token: str = "",
-                 timeout: float = 60.0):
+                 timeout: float = 60.0, agent_id: str = ""):
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
         self.token = token
         self.timeout = timeout
+        # Wave 1：agent 作用域（非空时每请求携带 X-Agent-Id 头）
+        self.agent_id = agent_id or ""
         self._client = httpx.AsyncClient(timeout=timeout)
         self._authenticated = False
 
@@ -54,6 +56,8 @@ class MemoryClient:
         extra = dict(kwargs.pop("headers", None) or {})
         if auth and self.token:
             extra.setdefault("Authorization", f"Bearer {self.token}")
+        if self.agent_id:
+            extra.setdefault("X-Agent-Id", self.agent_id)
         resp = await self._client.request(method, f"{self.base_url}{path}", headers=extra, **kwargs)
         if resp.status_code >= 400:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")

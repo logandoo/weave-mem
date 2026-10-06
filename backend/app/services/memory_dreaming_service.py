@@ -11,7 +11,17 @@ config = get_config()
 logger = logging.getLogger(__name__)
 
 
-async def run_active_dreaming(db: AsyncSession, user_id: str) -> list[dict]:
+def _scope_sql(agent_id: str | None = None, column: str = "agent_id") -> str:
+    from app.services.memory_scope import agent_scope_sql
+    return agent_scope_sql(agent_id, column)
+
+
+def _scope_params(agent_id: str | None = None) -> dict:
+    from app.services.memory_scope import agent_scope_params
+    return agent_scope_params(agent_id)
+
+
+async def run_active_dreaming(db: AsyncSession, user_id: str, agent_id: str | None = None) -> list[dict]:
     # 2026-08-16 修复：演练对象按"有效权重"（weight × Ebbinghaus 残差衰减，
     # anchor = max(last_recalled_at, weight_decayed_at)，与 run_weight_decay/
     # consolidation dream 共用同一 helper）排序——旧实现按原始 weight 恒序，
@@ -22,8 +32,8 @@ async def run_active_dreaming(db: AsyncSession, user_id: str) -> list[dict]:
     top_result = await db.execute(
         text(f"SELECT id, canonical_name, description_short, ROUND(CAST({eff_expr} AS numeric), 2) "
              "FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 "
-             "AND valid_to IS NULL ORDER BY " + eff_expr + " DESC LIMIT 10"),
-        {"uid": user_id},
+             "AND valid_to IS NULL " + _scope_sql(agent_id) + " ORDER BY " + eff_expr + " DESC LIMIT 10"),
+        {"uid": user_id, **_scope_params(agent_id)},
     )
     top_concepts = [{"id": r[0], "name": r[1], "short": r[2], "weight": float(r[3] or 0)} for r in top_result.fetchall()]
     # 附录 A 优化：概念数 <10 时跳过（记忆太少无需演练）
@@ -35,7 +45,7 @@ async def run_active_dreaming(db: AsyncSession, user_id: str) -> list[dict]:
         return []
 
     evaluations = await _rehearse_scenarios(scenarios, top_concepts)
-    return await _apply_dreaming_feedback(db, user_id, evaluations)
+    return await _apply_dreaming_feedback(db, user_id, evaluations, agent_id=agent_id)
 
 
 async def _generate_scenarios(concepts: list[dict]) -> list[str]:
@@ -82,7 +92,8 @@ async def _rehearse_scenarios(scenarios: list[str], concepts: list[dict]) -> lis
     return all_evals
 
 
-async def _apply_dreaming_feedback(db: AsyncSession, user_id: str, evaluations: list[dict]) -> list[dict]:
+async def _apply_dreaming_feedback(db: AsyncSession, user_id: str, evaluations: list[dict],
+                                   agent_id: str | None = None) -> list[dict]:
     """§5.5 Step 6c 记忆反馈：confirmed/contradicted/gap_found/new_insights/contradictions_found 全落地。"""
     results = []
     for ev in evaluations:
@@ -102,28 +113,29 @@ async def _apply_dreaming_feedback(db: AsyncSession, user_id: str, evaluations: 
                 )
             elif verdict == "gap_found" and note:
                 # §6c：gap_found → 创建新概念（dreaming / agent_inferred，weight=0.3，silent）
-                await _create_dreaming_concept(db, user_id, note)
+                await _create_dreaming_concept(db, user_id, note, agent_id=agent_id)
 
         for insight in ev.get("new_insights", []):
             # §6c：new_insights → 尝试匹配已有概念，失败则创建（agent_inferred，受 0.7 封顶）
             if isinstance(insight, str) and insight.strip():
-                await _match_or_create_insight(db, user_id, insight.strip())
+                await _match_or_create_insight(db, user_id, insight.strip(), agent_id=agent_id)
 
         for contra in ev.get("contradictions_found", []):
             # §6c：contradictions_found → 创建 concept_relations(type='contradicts')
-            await _create_contradiction_relation(db, user_id, contra)
+            await _create_contradiction_relation(db, user_id, contra, agent_id=agent_id)
 
         results.append({"concept_evaluations": evals_list})
     await db.commit()
     return results
 
 
-async def _create_dreaming_concept(db: AsyncSession, user_id: str, text_note: str) -> None:
+async def _create_dreaming_concept(db: AsyncSession, user_id: str, text_note: str,
+                                   agent_id: str | None = None) -> None:
     from app.services.memory_concept_service import create_concept
     name = text_note[:60]
     dup = await db.execute(
-        text("SELECT 1 FROM memory_concepts WHERE user_id = :uid AND canonical_name = :nm AND valid_to IS NULL LIMIT 1"),
-        {"uid": user_id, "nm": name},
+        text(f"SELECT 1 FROM memory_concepts WHERE user_id = :uid AND canonical_name = :nm AND valid_to IS NULL {_scope_sql(agent_id)} LIMIT 1"),
+        {"uid": user_id, "nm": name, **_scope_params(agent_id)},
     )
     if dup.fetchone():
         return
@@ -131,6 +143,7 @@ async def _create_dreaming_concept(db: AsyncSession, user_id: str, text_note: st
         db, user_id, canonical_name=name,
         description_short=text_note[:80], description_full=text_note,
         source_trust="agent_inferred", memory_type="semantic", source_type="dreaming",
+        agent_id=agent_id,
     )
     if cid:
         await db.execute(
@@ -139,11 +152,12 @@ async def _create_dreaming_concept(db: AsyncSession, user_id: str, text_note: st
         )
 
 
-async def _match_or_create_insight(db: AsyncSession, user_id: str, insight: str) -> None:
+async def _match_or_create_insight(db: AsyncSession, user_id: str, insight: str,
+                                   agent_id: str | None = None) -> None:
     from app.services.memory_concept_service import create_concept
     dup = await db.execute(
-        text("SELECT 1 FROM memory_concepts WHERE user_id = :uid AND canonical_name = :nm AND valid_to IS NULL LIMIT 1"),
-        {"uid": user_id, "nm": insight[:60]},
+        text(f"SELECT 1 FROM memory_concepts WHERE user_id = :uid AND canonical_name = :nm AND valid_to IS NULL {_scope_sql(agent_id)} LIMIT 1"),
+        {"uid": user_id, "nm": insight[:60], **_scope_params(agent_id)},
     )
     if dup.fetchone():
         return
@@ -151,7 +165,7 @@ async def _match_or_create_insight(db: AsyncSession, user_id: str, insight: str)
         from app.services.memory_embedding_service import embed_text, find_similar_concepts
         emb = await embed_text(insight)
         if emb:
-            similar = await find_similar_concepts(db, user_id, emb, top_k=1)
+            similar = await find_similar_concepts(db, user_id, emb, top_k=1, agent_id=agent_id)
             if similar and similar[0]["similarity"] >= 0.9:
                 return
     except Exception:
@@ -160,10 +174,12 @@ async def _match_or_create_insight(db: AsyncSession, user_id: str, insight: str)
         db, user_id, canonical_name=insight[:60],
         description_short=insight[:80], description_full=insight,
         source_trust="agent_inferred", memory_type="semantic", source_type="dreaming",
+        agent_id=agent_id,
     )
 
 
-async def _create_contradiction_relation(db: AsyncSession, user_id: str, contra) -> None:
+async def _create_contradiction_relation(db: AsyncSession, user_id: str, contra,
+                                         agent_id: str | None = None) -> None:
     """contradictions_found 项 → contradicts 关系。兼容 dict({source,target}) 与自由文本两种形态。"""
     src_name = tgt_name = None
     if isinstance(contra, dict):
@@ -172,8 +188,8 @@ async def _create_contradiction_relation(db: AsyncSession, user_id: str, contra)
     elif isinstance(contra, str):
         # 自由文本：提取其中提到的概念名，取前两个配对
         r = await db.execute(
-            text("SELECT canonical_name FROM memory_concepts WHERE user_id = :uid AND valid_to IS NULL"),
-            {"uid": user_id},
+            text(f"SELECT canonical_name FROM memory_concepts WHERE user_id = :uid AND valid_to IS NULL {_scope_sql(agent_id)}"),
+            {"uid": user_id, **_scope_params(agent_id)},
         )
         mentioned = [row[0] for row in r.fetchall() if row[0] and row[0] in contra]
         if len(mentioned) >= 2:
@@ -182,8 +198,8 @@ async def _create_contradiction_relation(db: AsyncSession, user_id: str, contra)
         return
 
     r = await db.execute(
-        text("SELECT id, canonical_name FROM memory_concepts WHERE user_id = :uid AND canonical_name = ANY(:names) AND valid_to IS NULL"),
-        {"uid": user_id, "names": [src_name, tgt_name]},
+        text(f"SELECT id, canonical_name FROM memory_concepts WHERE user_id = :uid AND canonical_name = ANY(:names) AND valid_to IS NULL {_scope_sql(agent_id)}"),
+        {"uid": user_id, "names": [src_name, tgt_name], **_scope_params(agent_id)},
     )
     id_map = {row[1]: row[0] for row in r.fetchall()}
     sid, tid = id_map.get(src_name), id_map.get(tgt_name)
@@ -197,7 +213,7 @@ async def _create_contradiction_relation(db: AsyncSession, user_id: str, contra)
         return
     from app.services.memory_cluster_service import create_relation
     await create_relation(db, user_id, sid, tid, "contradicts",
-                          "Dreaming 演练发现矛盾", weight=0.6)
+                          "Dreaming 演练发现矛盾", weight=0.6, agent_id=agent_id)
     from app.services.memory_weight_service import apply_reinforcement_signal
     await apply_reinforcement_signal(db, sid, "dreaming_contradiction")
     await apply_reinforcement_signal(db, tid, "dreaming_contradiction")

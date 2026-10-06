@@ -140,6 +140,7 @@ def _unit_source_trust(unit_kind: str, source_ids: list[str] | None = None) -> s
 
 async def ingest_raw_unit(
     db: AsyncSession, user_id: str, unit_kind: str, raw_text: str, source_ids: list[str],
+    agent_id: str | None = None, conversation_id: str | None = None,
 ) -> Optional[str]:
     if not raw_text or len(raw_text) < 5:
         return None
@@ -154,9 +155,11 @@ async def ingest_raw_unit(
     unit = SubconsciousLog(
         id=unit_id,
         user_id=user_id,
+        agent_id=agent_id,
         unit_kind=unit_kind,
         raw_text=clean_text,
         source_ids=json.dumps(source_ids, ensure_ascii=False),
+        conversation_id=conversation_id,
         embedding=emb,
     )
     db.add(unit)
@@ -165,8 +168,9 @@ async def ingest_raw_unit(
 
 
 async def ingest_pending_raw_units(db: AsyncSession, user_id: str) -> int:
+    # Wave 1：水位线扫描=旧笔记/消息域（无 agent 归属），固定读写共享状态行（agent_id IS NULL）。
     result = await db.execute(
-        text("SELECT id, last_message_processed_at, last_note_processed_at, last_file_memory_processed_at FROM user_agent_states WHERE user_id = :uid"),
+        text("SELECT id, last_message_processed_at, last_note_processed_at, last_file_memory_processed_at FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL"),
         {"uid": user_id},
     )
     row = result.fetchone()
@@ -345,7 +349,8 @@ async def _load_file_memory_units(db: AsyncSession, user_id: str) -> list[tuple[
     return units
 
 
-async def scan_recurrence(db: AsyncSession, user_id: str) -> int:
+async def scan_recurrence(db: AsyncSession, user_id: str, agent_id: str | None = None) -> int:
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     sub_cfg = config.memory_subconscious
     sim_threshold = float(sub_cfg.get("recurrence_sim_threshold", 0.6))
     count_threshold = int(sub_cfg.get("recurrence_count_threshold", 3))
@@ -357,8 +362,8 @@ async def scan_recurrence(db: AsyncSession, user_id: str) -> int:
     promote_count = 0
 
     result = await db.execute(
-        text("SELECT id, raw_text, embedding, created_at, recurrence_count, recurrence_scan_count FROM subconscious_log WHERE user_id = :uid AND promoted = FALSE AND embedding IS NOT NULL AND recurrence_scan_count < :max_scans ORDER BY created_at ASC LIMIT :lim"),
-        {"uid": user_id, "lim": batch_size, "max_scans": max_scans},
+        text(f"SELECT id, raw_text, embedding, created_at, recurrence_count, recurrence_scan_count FROM subconscious_log WHERE user_id = :uid AND promoted = FALSE AND embedding IS NOT NULL AND recurrence_scan_count < :max_scans {agent_scope_sql(agent_id)} ORDER BY created_at ASC LIMIT :lim"),
+        {"uid": user_id, "lim": batch_size, "max_scans": max_scans, **agent_scope_params(agent_id)},
     )
     rows = result.fetchall()
     if not rows:
@@ -386,7 +391,8 @@ async def scan_recurrence(db: AsyncSession, user_id: str) -> int:
         if rec_count >= accel_threshold:
             effective_count = 2
 
-        neighbors = await find_neighbors_for_unit(db, user_id, emb_data, unit_id, created_at, top_k)
+        neighbors = await find_neighbors_for_unit(db, user_id, emb_data, unit_id, created_at, top_k,
+                                                  agent_id=agent_id)
         relevant = [n for n in neighbors if n["similarity"] >= sim_threshold]
         if len(relevant) < effective_count:
             await db.execute(
@@ -425,7 +431,7 @@ async def scan_recurrence(db: AsyncSession, user_id: str) -> int:
             else:
                 u["source_trust"] = "user_stated"
 
-        llm_output = await _call_extraction_llm(cluster_units, db, user_id)
+        llm_output = await _call_extraction_llm(cluster_units, db, user_id, agent_id=agent_id)
         if not llm_output:
             await db.execute(
                 text("UPDATE subconscious_log SET recurrence_scan_count = recurrence_scan_count + 1 WHERE id = :id"),
@@ -433,27 +439,28 @@ async def scan_recurrence(db: AsyncSession, user_id: str) -> int:
             )
             continue
 
-        await _execute_promotion(db, user_id, cluster_units, llm_output)
+        await _execute_promotion(db, user_id, cluster_units, llm_output, agent_id=agent_id)
         promote_count += 1
 
     return promote_count
 
 
 async def _call_extraction_llm(
-    cluster_units: list[dict], db: AsyncSession, user_id: str,
+    cluster_units: list[dict], db: AsyncSession, user_id: str, agent_id: str | None = None,
 ) -> dict | None:
     from app.services.memory_llm_factory import _memory_llm
     from app.services.memory_concept_service import get_concepts_for_extraction, get_clusters_for_extraction
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
 
-    existing_concepts = await get_concepts_for_extraction(db, user_id)
-    existing_clusters = await get_clusters_for_extraction(db, user_id)
+    existing_concepts = await get_concepts_for_extraction(db, user_id, agent_id=agent_id)
+    existing_clusters = await get_clusters_for_extraction(db, user_id, agent_id=agent_id)
 
     # §5.2 冷启动兜底配套：建库初期放宽写入门控
     gate_hint = ""
     try:
         active_count_result = await db.execute(
-            text("SELECT COUNT(*) FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 AND valid_to IS NULL"),
-            {"uid": user_id},
+            text(f"SELECT COUNT(*) FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 AND valid_to IS NULL {agent_scope_sql(agent_id)}"),
+            {"uid": user_id, **agent_scope_params(agent_id)},
         )
         bootstrap = int(config.memory_retrieval.get("bootstrap_threshold", 10)) if hasattr(config, "memory_retrieval") else 10
         if (active_count_result.scalar() or 0) < bootstrap:
@@ -537,12 +544,13 @@ async def _call_extraction_llm(
 
 async def _execute_promotion(
     db: AsyncSession, user_id: str, cluster_units: list[dict], llm_output: dict,
+    agent_id: str | None = None,
 ) -> None:
     from app.services.memory_concept_service import extract_concepts_from_recurrence, reconcile_concept_sources
     source_unit_ids = [u["id"] for u in cluster_units]
     raw_texts = [u["raw_text"] for u in cluster_units]
     concept_ids, episode_id = await extract_concepts_from_recurrence(
-        db, user_id, llm_output, source_unit_ids, raw_texts,
+        db, user_id, llm_output, source_unit_ids, raw_texts, agent_id=agent_id,
     )
     for u in cluster_units:
         await db.execute(
@@ -551,7 +559,7 @@ async def _execute_promotion(
         )
     # §5.1.d step 3：对账 pass——来源全部失效的概念标 needs_review
     try:
-        await reconcile_concept_sources(db, user_id)
+        await reconcile_concept_sources(db, user_id, agent_id=agent_id)
     except Exception:
         logger.debug("reconcile_concept_sources failed for user=%s", user_id, exc_info=True)
 

@@ -150,7 +150,7 @@
           "auth"
         ],
         "summary": "Create Pat Token",
-        "description": "创建个人访问令牌（PAT）：明文仅本次响应返回，之后不可再查（memos 借鉴）。",
+        "description": "创建个人访问令牌（PAT）：明文仅本次响应返回，之后不可再查（memos 借鉴）。\n\nWave 1：可选 body.agent_id 绑定作用域（此后该 token 免 header 即为该 agent）。",
         "operationId": "create_pat_token_api_auth_tokens_post",
         "requestBody": {
           "content": {
@@ -902,7 +902,7 @@
           "memory"
         ],
         "summary": "Ingest Endpoint",
-        "description": "潜意识摄入：文本写入 SubconsciousLog（PII scrub + embedding）。\n\n与 chatbot agent 工具同款语义；embedding provider 未配置时 503 显式降级\n（scan_recurrence 依赖向量邻居，无向量则摄入无意义）。",
+        "description": "潜意识摄入：文本写入 SubconsciousLog（PII scrub + embedding）。\n\n与 chatbot agent 工具同款语义；embedding provider 未配置时 503 显式降级\n（scan_recurrence 依赖向量邻居，无向量则摄入无意义）。\nWave 1：写入 agent_id 作用域 + conversation_id 会话归因。",
         "operationId": "ingest_endpoint_api_memory_ingest_post",
         "requestBody": {
           "content": {
@@ -1443,6 +1443,17 @@
           "password": {
             "type": "string",
             "title": "Password"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
           }
         },
         "type": "object",

@@ -1,0 +1,72 @@
+{
+  "description": "weave-mem lifecycle hooks: recall injection on prompts, incremental capture on stop/compact/session-end, subagent capture. All hooks fail open (never block the session).",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/../shared/hooks/session-start.mjs\" --harness=claude-code",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/../shared/hooks/auto-recall.mjs\" --harness=claude-code",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/../shared/hooks/auto-capture.mjs\" --harness=claude-code",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/../shared/hooks/auto-capture.mjs\" --harness=claude-code",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/../shared/hooks/auto-capture.mjs\" --harness=claude-code",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/../shared/hooks/auto-capture.mjs\" --harness=claude-code",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

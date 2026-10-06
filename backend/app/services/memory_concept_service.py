@@ -58,16 +58,18 @@ def _sanitize_importance(cdata: dict) -> float:
 
 
 
-async def get_concepts_for_extraction(db: AsyncSession, user_id: str, limit: int = 200) -> list[dict]:
+async def get_concepts_for_extraction(db: AsyncSession, user_id: str, limit: int = 200,
+                                      agent_id: str | None = None) -> list[dict]:
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     result = await db.execute(
-        text("""
+        text(f"""
             SELECT id, canonical_name, aliases, description_short, source_trust,
                    memory_type, activation_strength, status
             FROM memory_concepts
-            WHERE user_id = :uid AND status IN ('active','silent') AND valid_to IS NULL
+            WHERE user_id = :uid AND status IN ('active','silent') AND valid_to IS NULL {agent_scope_sql(agent_id)}
             ORDER BY weight DESC LIMIT :lim
         """),
-        {"uid": user_id, "lim": limit},
+        {"uid": user_id, "lim": limit, **agent_scope_params(agent_id)},
     )
     return [
         {"id": r[0], "canonical_name": r[1], "aliases": r[2], "description_short": r[3],
@@ -76,18 +78,21 @@ async def get_concepts_for_extraction(db: AsyncSession, user_id: str, limit: int
     ]
 
 
-async def get_clusters_for_extraction(db: AsyncSession, user_id: str, limit: int = 50) -> list[dict]:
+async def get_clusters_for_extraction(db: AsyncSession, user_id: str, limit: int = 50,
+                                      agent_id: str | None = None) -> list[dict]:
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     result = await db.execute(
-        text("SELECT id, name, summary FROM memory_clusters WHERE user_id = :uid ORDER BY weight DESC LIMIT :lim"),
-        {"uid": user_id, "lim": limit},
+        text(f"SELECT id, name, summary FROM memory_clusters WHERE user_id = :uid {agent_scope_sql(agent_id)} ORDER BY weight DESC LIMIT :lim"),
+        {"uid": user_id, "lim": limit, **agent_scope_params(agent_id)},
     )
     return [{"id": r[0], "name": r[1], "summary": r[2]} for r in result.fetchall()]
 
 
 async def extract_concepts_from_recurrence(
     db: AsyncSession, user_id: str, llm_output: dict, source_unit_ids: list[str],
-    raw_texts: list[str],
+    raw_texts: list[str], agent_id: str | None = None,
 ) -> tuple[list[str], Optional[str]]:
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     concept_ids: list[str] = []
     episode_id: Optional[str] = None
 
@@ -96,29 +101,33 @@ async def extract_concepts_from_recurrence(
         concepts_data = []
 
     for cdata in concepts_data:
-        cid = await _process_single_concept(db, user_id, cdata, source_unit_ids, raw_texts)
+        cid = await _process_single_concept(db, user_id, cdata, source_unit_ids, raw_texts,
+                                            agent_id=agent_id)
         if cid:
             concept_ids.append(cid)
 
     epic_data = llm_output.get("episodic", {})
     if epic_data and epic_data.get("narrative"):
-        episode_id = await _handle_episode_from_extraction(db, user_id, epic_data, source_unit_ids, concept_ids)
+        episode_id = await _handle_episode_from_extraction(db, user_id, epic_data, source_unit_ids, concept_ids,
+                                                           agent_id=agent_id)
 
     # D1（门 deterministic_edges_enabled，默认关）：提炼后建确定性共现边（fail-open）
     if concept_ids and config.memory_retrieval.get("deterministic_edges_enabled", False):
         try:
             from app.services.memory_cluster_service import build_deterministic_edges
-            await build_deterministic_edges(db, user_id, concept_ids)
+            await build_deterministic_edges(db, user_id, concept_ids, agent_id=agent_id)
         except Exception:
             logger.debug("deterministic edges hook failed (fail-open)", exc_info=True)
 
-    # §5.1.d step 4：同步 total_concept_count / total_episode_count
+    # §5.1.d step 4：同步 total_concept_count / total_episode_count（精确写本作用域 UAS 行；
+    # 读用 scope 片段会同时命中共享行——写定位必须精确，D-9 修复轮 A4.9 I2）
+    _exact_w = "AND agent_id = :agent_scope" if agent_id else "AND agent_id IS NULL"
     await db.execute(
-        text("""UPDATE user_agent_states SET
-            total_concept_count = (SELECT COUNT(*) FROM memory_concepts WHERE user_id = :uid AND valid_to IS NULL),
-            total_episode_count = (SELECT COUNT(*) FROM memory_episodes WHERE user_id = :uid AND valid_to IS NULL)
-            WHERE user_id = :uid"""),
-        {"uid": user_id},
+        text(f"""UPDATE user_agent_states SET
+            total_concept_count = (SELECT COUNT(*) FROM memory_concepts WHERE user_id = :uid AND valid_to IS NULL {agent_scope_sql(agent_id)}),
+            total_episode_count = (SELECT COUNT(*) FROM memory_episodes WHERE user_id = :uid AND valid_to IS NULL {agent_scope_sql(agent_id)})
+            WHERE user_id = :uid {_exact_w}"""),
+        {"uid": user_id, **agent_scope_params(agent_id)},
     )
 
     await db.commit()
@@ -128,6 +137,7 @@ async def extract_concepts_from_recurrence(
 async def _handle_episode_from_extraction(
     db: AsyncSession, user_id: str, epic_data: dict,
     source_unit_ids: list[str], concept_ids: list[str],
+    agent_id: str | None = None,
 ) -> Optional[str]:
     from app.services.memory_episode_service import create_episode, merge_episode, merge_first
 
@@ -151,7 +161,7 @@ async def _handle_episode_from_extraction(
 
     if merge_with and isinstance(merge_with, str):
         target = await db.get(MemoryEpisode, merge_with)
-        if target is not None and target.user_id == user_id:
+        if target is not None and target.user_id == user_id and (target.agent_id or None) == (agent_id or None):
             await merge_episode(db, merge_with, narrative, source_unit_ids,
                                 participants=participants, locations=locations)
             return merge_with
@@ -160,20 +170,22 @@ async def _handle_episode_from_extraction(
     # §4.9 merge-first：LLM 未给 merge id 时，按 sim≥0.85 最近邻 in-place 合并
     try:
         merged_id = await merge_first(db, user_id, narrative, source_unit_ids,
-                                      participants=participants, locations=locations)
+                                      participants=participants, locations=locations,
+                                      agent_id=agent_id)
         if merged_id:
             return merged_id
     except Exception:
         logger.debug("merge_first failed, fallback to create", exc_info=True)
 
     eid = await create_episode(db, user_id, narrative, valid_from, source_unit_ids, concept_ids,
-                               participants=participants, locations=locations)
+                               participants=participants, locations=locations, agent_id=agent_id)
     return eid
 
 
 async def _process_single_concept(
     db: AsyncSession, user_id: str, cdata: dict,
     source_unit_ids: list[str], raw_texts: list[str],
+    agent_id: str | None = None,
 ) -> Optional[str]:
     canonical_name = (cdata.get("canonical_name") or "").strip()
     if not canonical_name:
@@ -209,8 +221,9 @@ async def _process_single_concept(
 
     if match_existing_id and isinstance(match_existing_id, str) and match_existing_id.strip():
         existing = await db.get(MemoryConcept, match_existing_id)
-        if existing is not None and existing.user_id != user_id:
-            logger.warning("match_existing_id rejected (cross-user): %s", match_existing_id)
+        if existing is not None and (existing.user_id != user_id
+                                     or (existing.agent_id or None) != (agent_id or None)):
+            logger.warning("match_existing_id rejected (cross-user or cross-agent): %s", match_existing_id)
             existing = None
         if existing:
             existing.description_full = _merge_description_full(existing.description_full or "", desc_full_safe)
@@ -245,10 +258,10 @@ async def _process_single_concept(
             existing.source_unit_ids = json.dumps(existing_source_ids, ensure_ascii=False)
 
             if cluster_suggestion:
-                await _ensure_cluster_membership(db, user_id, existing.id, cluster_suggestion)
+                await _ensure_cluster_membership(db, user_id, existing.id, cluster_suggestion, agent_id=agent_id)
 
             await db.flush()
-            _update_bm25_on_concept_change(existing.id, user_id, canonical_name, aliases_json, desc_full_safe)
+            _update_bm25_on_concept_change(existing.id, user_id, canonical_name, aliases_json, desc_full_safe, agent_id=agent_id)
             return existing.id
 
     concept_id = str(uuid.uuid4())
@@ -265,6 +278,7 @@ async def _process_single_concept(
     concept = MemoryConcept(
         id=concept_id,
         user_id=user_id,
+        agent_id=agent_id,
         canonical_name=canonical_name,
         description_short=desc_safe,
         description_full=desc_full_safe,
@@ -288,9 +302,9 @@ async def _process_single_concept(
     await db.flush()
 
     if cluster_suggestion:
-        await _ensure_cluster_membership(db, user_id, concept_id, cluster_suggestion)
+        await _ensure_cluster_membership(db, user_id, concept_id, cluster_suggestion, agent_id=agent_id)
 
-    _update_bm25_on_concept_change(concept_id, user_id, canonical_name, aliases_json, desc_full_safe)
+    _update_bm25_on_concept_change(concept_id, user_id, canonical_name, aliases_json, desc_full_safe, agent_id=agent_id)
     return concept_id
 
 
@@ -329,12 +343,15 @@ async def _generate_embedding(name: str, aliases: list, short_desc: str) -> Opti
 
 async def _ensure_cluster_membership(
     db: AsyncSession, user_id: str, concept_id: str, cluster_name: str,
+    agent_id: str | None = None,
 ) -> None:
+    from app.services.memory_scope import agent_scope_params
     if not cluster_name.strip():
         return
+    _exact_w = "AND agent_id = :agent_scope" if agent_id else "AND agent_id IS NULL"
     result = await db.execute(
-        text("SELECT id, embedding, member_count FROM memory_clusters WHERE user_id = :uid AND name = :nm"),
-        {"uid": user_id, "nm": cluster_name},
+        text(f"SELECT id, embedding, member_count FROM memory_clusters WHERE user_id = :uid AND name = :nm {_exact_w}"),
+        {"uid": user_id, "nm": cluster_name, **agent_scope_params(agent_id)},
     )
     row = result.fetchone()
     if row:
@@ -351,8 +368,8 @@ async def _ensure_cluster_membership(
     else:
         cid = str(uuid.uuid4())
         await db.execute(
-            text("INSERT INTO memory_clusters (id, user_id, name, member_count) VALUES (:id, :uid, :nm, 1)"),
-            {"id": cid, "uid": user_id, "nm": cluster_name},
+            text("INSERT INTO memory_clusters (id, user_id, agent_id, name, member_count) VALUES (:id, :uid, :aid, :nm, 1)"),
+            {"id": cid, "uid": user_id, "aid": agent_id, "nm": cluster_name},
         )
         await db.execute(
             text("INSERT INTO concept_cluster_members (concept_id, cluster_id) VALUES (:cid, :clid) ON CONFLICT DO NOTHING"),
@@ -367,15 +384,13 @@ async def _ensure_cluster_membership(
         logger.debug("cluster embedding refresh failed (fail-open)", exc_info=True)
 
 
-def _update_bm25_on_concept_change(concept_id: str, user_id: str, name: str, aliases_json: str, desc_full: str) -> None:
+def _update_bm25_on_concept_change(concept_id: str, user_id: str, name: str, aliases_json: str, desc_full: str,
+                                   agent_id: str | None = None) -> None:
     try:
-        from app.services.memory_bm25 import _name_indexes, _desc_indexes
+        from app.services.memory_bm25 import update_concept_in_indexes
         aliases = _parse_json_array(aliases_json)
         name_text = " ".join([name] + [str(a) for a in aliases])
-        for idx_map, txt in [(_name_indexes, name_text), (_desc_indexes, desc_full)]:
-            idx = idx_map.get(user_id)
-            if idx is not None and txt:
-                idx.update_doc(concept_id, txt)
+        update_concept_in_indexes(concept_id, user_id, agent_id, name_text, desc_full)
     except Exception:
         pass
 
@@ -386,6 +401,7 @@ async def create_concept(
     db: AsyncSession, user_id: str, canonical_name: str, description_short: str = "",
     description_full: str = "", source_trust: str = "user_stated",
     memory_type: str = "semantic", source_type: str = "manual",
+    agent_id: str | None = None,
 ) -> Optional[str]:
     canonical_name = canonical_name.strip()
     if not canonical_name:
@@ -403,6 +419,7 @@ async def create_concept(
     concept = MemoryConcept(
         id=cid,
         user_id=user_id,
+        agent_id=agent_id,
         canonical_name=canonical_name,
         description_short=desc_short,
         description_full=desc_full,
@@ -422,7 +439,7 @@ async def create_concept(
     )
     db.add(concept)
     await db.flush()
-    _update_bm25_on_concept_change(cid, user_id, canonical_name, aliases_json, desc_full)
+    _update_bm25_on_concept_change(cid, user_id, canonical_name, aliases_json, desc_full, agent_id=agent_id)
     return cid
 
 
@@ -438,7 +455,7 @@ async def update_concept_description(
     if emb:
         concept.embedding = emb
         concept.embedding_updated_at = datetime.utcnow()
-        _update_bm25_on_concept_change(concept_id, concept.user_id, concept.canonical_name, concept.aliases or "[]", concept.description_full or "")
+        _update_bm25_on_concept_change(concept_id, concept.user_id, concept.canonical_name, concept.aliases or "[]", concept.description_full or "", agent_id=concept.agent_id)
     concept.updated_at = datetime.utcnow()
     await db.flush()
     return True
@@ -482,18 +499,19 @@ async def merge_concepts(db: AsyncSession, kept_id: str, merged_id: str) -> bool
         {"k": kept_id, "m": merged_id},
     )
 
-    _update_bm25_on_concept_change(kept_id, kept.user_id, kept.canonical_name, kept.aliases or "[]", kept.description_full or "")
+    _update_bm25_on_concept_change(kept_id, kept.user_id, kept.canonical_name, kept.aliases or "[]", kept.description_full or "", agent_id=kept.agent_id)
     return True
 
 
-async def reconcile_concept_sources(db: AsyncSession, user_id: str) -> int:
+async def reconcile_concept_sources(db: AsyncSession, user_id: str, agent_id: str | None = None) -> int:
     """§5.1.d step 3 / §3.3 对账 pass：source_raw_ids 与 source_unit_ids 全部失效
     （raw 条目已删除/不存在）的概念标记 needs_review=TRUE，由夜间 consolidation 复核。"""
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     result = await db.execute(
-        text("""SELECT id, source_raw_ids, source_unit_ids FROM memory_concepts
+        text(f"""SELECT id, source_raw_ids, source_unit_ids FROM memory_concepts
                 WHERE user_id = :uid AND valid_to IS NULL AND needs_review = FALSE
-                  AND (source_raw_ids IS NOT NULL OR source_unit_ids IS NOT NULL)"""),
-        {"uid": user_id},
+                  AND (source_raw_ids IS NOT NULL OR source_unit_ids IS NOT NULL) {agent_scope_sql(agent_id)}"""),
+        {"uid": user_id, **agent_scope_params(agent_id)},
     )
     flagged = 0
     for row in result.fetchall():

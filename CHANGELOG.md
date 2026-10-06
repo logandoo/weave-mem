@@ -2,6 +2,39 @@
 
 No version numbers during v0.x; entries are date-based. Format loosely follows Keep a Changelog.
 
+## 2026-10-06 — agent integrations (Claude Code / Codex / OpenCode / dsh)
+
+### Added
+- `integrations/shared/` — zero-dependency Node core: config resolution (`WEAVE_MEM_*` env > `~/.weave-mem/config.json` > defaults), HTTP client (recall/ingest/health, `X-Agent-Id` header), recall-block build/strip, transcript turn extraction (Claude Code + Codex JSONL shapes), capture cursor state (atomic writes), debug log. `node integrations/shared/selftest.mjs` → 27 checks.
+- `integrations/claude-code/` — plugin: `UserPromptSubmit` recall injection, incremental capture on `Stop`/`PreCompact`/`SessionEnd`/`SubagentStop` (subagent transcripts under `cc-<session>:<agent>`), `.mcp.json`, README.
+- `integrations/codex/` — same hook core with Codex's output contract (no `decision:approve`; `Stop` no-op `{}`), README with hook-trust and path notes.
+- `integrations/opencode/weave-mem-memory.js` — V1 plugin (`chat.message` synthetic recall part; `session.idle` message pull + capture) and V2 `setup()` beta; README.
+- `integrations/dsh/` — Cordis plugin written against the real dsh 0.1.5-rc API, verified end-to-end against a live headless profile: `agent/session-start` stages the recall block and `agent/pre-step` merges it with the step query into one durable plugin message (the late `agent.inject()` spurious-turn race was found at runtime); `session/event` captures user/assistant text (plugin-source and reasoning parts filtered; assistant nested at `data.message`); a durable pending queue (`~/.weave-mem/state/dsh-pending.jsonl`) survives process-exit truncation and replays at the next session start. Real constructor resolution via `createRequire(process.argv[1])` (bare import fails for absolute-path plugin loading).
+- `tests/test_integrations.py` — 29 checks: shared selftest, CC/Codex hook contract against a recording sink (payload/header/scope assertions), fail-open verification, live-server recall (text channel + PAT + agent scope), OpenCode/dsh contract harnesses. CI pg-full includes it.
+
+### Design notes
+- Capture is a single `POST /api/memory/ingest` per turn — recurrence gating means no session/commit/token-threshold machinery (the structural difference from session-commit memory systems).
+- Injected `<weave-mem-context>` blocks are stripped before capture (no self-referential pollution); duplicate capture is prevented by per-session turn cursors (Claude Code/Codex/OpenCode) and a content-hash id set (dsh). The server has no source_ids idempotency, so retries after an aborted response are at-least-once (documented, see tests/decisions.md D-16).
+- All hooks fail open: server unreachable → empty output, exit 0, host never blocked.
+
+## 2026-10-06 — agent scope wave (multi-agent memory namespaces)
+
+### Added
+- **Agent identity namespace**: `agent_id` on memory tables (`memory_concepts`/`memory_episodes`/`subconscious_log`/`memory_clusters`/`concept_relations`/`memory_clarifications`/`memory_recall_log`/`memory_llm_calls`), `personal_access_tokens.agent_id`, `subconscious_log.conversation_id`; new `agents` registry table. `NULL` = user-level shared memory; non-NULL = agent-private. Reads resolve `shared + own`; writes are stamped with the caller.
+- **Identity plumbing**: `X-Agent-Id` request header (validated `[A-Za-z0-9._-]{1,64}`, 422 otherwise; wins over token binding) · `POST /api/auth/tokens {"agent_id": …}` binds a PAT · `POST /api/auth/login {"agent_id": …}` mints a scoped JWT.
+- **Per-(user, agent) state**: `user_agent_states` keyed by expression unique index `(user_id, COALESCE(agent_id,''))`; scheduler iterates `(user, agent)` scopes, per-scope advisory locks, per-scope consolidation/scan; consolidation merges only within one scope (`IS NOT DISTINCT FROM` on ANN prefilter).
+- **Attribution**: `agent_id` in concepts/episodes/dreams/clarifications list responses, recall-log rows, and `POST /api/memory/ingest` responses.
+- **SDK/MCP**: `MemoryClient(..., agent_id="…")` sends the scope header; MCP reads `WEAVE_MEM_AGENT_ID` env (or `[mcp] agent_id`).
+- `tests/test_agent_scope.py` (39 checks; PG) + CI pg-full includes it.
+
+### Changed
+- Retrieval: BM25 indexes and session cache are keyed per `(user, agent scope)`; dense search, graph expansion, UAS summary/dream/profile reads are scope-filtered.
+- Legacy per-user services (message/note watermark scan, migration, cost governance, profile sync) explicitly pin the shared (`agent_id IS NULL`) state row.
+
+### Notes
+- Existing rows keep `agent_id = NULL` → full backward compatibility (legacy clients read/write shared scope).
+- SQLite: `DROP CONSTRAINT` migrations are skipped (SQLite lacks the syntax); stale SQLite DBs keep their old `unique(user_id)` and degrade to missing per-agent state rows (scoping is unaffected); fresh DBs are correct.
+
 ## 2026-10-05 — client SDK + outbound provider normalization
 
 ### Added

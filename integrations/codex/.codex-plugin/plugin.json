@@ -1,0 +1,5 @@
+{
+  "name": "weave-mem",
+  "description": "Automatic long-term memory for Codex backed by weave-mem: auto-recall on UserPromptSubmit, incremental capture on Stop/PreCompact/SessionEnd (agent scope: codex).",
+  "version": "0.1.0"
+}

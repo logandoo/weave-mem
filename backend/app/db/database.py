@@ -11,7 +11,7 @@
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base, relationship
-from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Boolean, Float, Integer, JSON, TypeDecorator
+from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Boolean, Float, Integer, JSON, TypeDecorator, UniqueConstraint
 from datetime import datetime
 import uuid
 
@@ -93,9 +93,28 @@ class PersonalAccessToken(Base):
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     token_hash = Column(String(64), nullable=False, unique=True)
     name = Column(String(100), nullable=False, default="")
+    # Wave 1：可选绑定 agent 身份（PAT 即携带作用域，插件免 header）
+    agent_id = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used_at = Column(DateTime, nullable=True)
     revoked_at = Column(DateTime, nullable=True)
+
+
+class Agent(Base):
+    """Agent 注册表（Wave 1）：agent_key 为用户内唯一命名空间标签（非安全边界）。"""
+
+    __tablename__ = "agents"
+    __table_args__ = (
+        UniqueConstraint("user_id", "agent_key", name="uq_agents_user_key"),
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    agent_key = Column(String(64), nullable=False)
+    display_name = Column(String(120), nullable=True)
+    kind = Column(String(32), nullable=False, default="manual")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, nullable=True)
 
 
 class User(Base):
@@ -117,7 +136,7 @@ class User(Base):
     sessions = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
 
     notebooks = relationship("Notebook", back_populates="user", cascade="all, delete-orphan")
-    agent_state = relationship("UserAgentState", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    agent_state = relationship("UserAgentState", back_populates="user", cascade="all, delete-orphan")
 
 class Conversation(Base):
     __tablename__ = "conversations"
@@ -171,7 +190,11 @@ class UserAgentState(Base):
     __tablename__ = "user_agent_states"
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    # Wave 1：每 (user, agent) 一行；agent_id IS NULL = 用户级共享状态行。
+    # 唯一性由迁移表达式索引 ON (user_id, COALESCE(agent_id,'')) 保证
+    # （PG 对 NULL 不去重，不能直接用 (user_id, agent_id) 唯一约束）。
+    agent_id = Column(String(64), nullable=True)
     agent_name = Column(String(120), nullable=False, default="共享智能体")
     memory_summary = Column(Text, nullable=True)
     dream_summary = Column(Text, nullable=True)
@@ -231,6 +254,7 @@ class MemoryConcept(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    agent_id = Column(String(64), nullable=True)
     canonical_name = Column(String(500), nullable=False)
     description_short = Column(String(80), nullable=False)
     description_full = Column(Text, nullable=True)
@@ -266,6 +290,7 @@ class MemoryCluster(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    agent_id = Column(String(64), nullable=True)
     name = Column(String(255), nullable=False)
     summary = Column(Text, nullable=True)
     weight = Column(Float, nullable=False, default=0.5)
@@ -293,6 +318,7 @@ class ConceptRelation(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    agent_id = Column(String(64), nullable=True)
     source_id = Column(String(36), ForeignKey("memory_concepts.id", ondelete="CASCADE"), nullable=False)
     target_id = Column(String(36), ForeignKey("memory_concepts.id", ondelete="CASCADE"), nullable=False)
     relation_type = Column(String(50), nullable=False)
@@ -308,6 +334,7 @@ class MemoryClarification(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    agent_id = Column(String(64), nullable=True)
     conversation_id = Column(String(36), nullable=True)
     message_id = Column(String(36), nullable=True)
     original_text = Column(Text, nullable=False)
@@ -325,9 +352,12 @@ class SubconsciousLog(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    agent_id = Column(String(64), nullable=True)
     unit_kind = Column(String(20), nullable=False, default="message")
     raw_text = Column(Text, nullable=False)
     source_ids = Column(Text, nullable=False)
+    # Wave 1：外部 harness 会话归因（插件 ingest 时携带，可空）
+    conversation_id = Column(String(64), nullable=True)
     embedding = Column(memory_vector(), nullable=True)
     promoted = Column(Boolean, nullable=False, default=False)
     promoted_at = Column(DateTime, nullable=True)
@@ -342,6 +372,7 @@ class MemoryEpisode(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    agent_id = Column(String(64), nullable=True)
     narrative = Column(Text, nullable=False)
     source_unit_ids = Column(Text, nullable=False)
     source_concept_ids = Column(Text, nullable=True)
@@ -364,6 +395,7 @@ class MemoryLLMCall(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    agent_id = Column(String(64), nullable=True)
     kind = Column(String(50), nullable=False)
     model = Column(String(100), nullable=True)
     prompt_tokens = Column(Integer, nullable=False, default=0)
@@ -380,6 +412,7 @@ class MemoryRecallLog(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    agent_id = Column(String(64), nullable=True)
     conversation_id = Column(String(36), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=True)
     query_hash = Column(String(64), nullable=False)
     candidate_ids = Column(Text, nullable=True)

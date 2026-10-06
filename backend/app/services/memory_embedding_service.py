@@ -210,9 +210,10 @@ def _emb_from_db(raw) -> Optional[list[float]]:
 async def find_similar_concepts(
     db: AsyncSession, user_id: str, embedding: list[float], top_k: int = 10,
     include_expired: bool = False, active_concept_count: int = 0,
-    bootstrap_threshold: int = 10,
+    bootstrap_threshold: int = 10, agent_id: str | None = None,
 ) -> list[dict]:
     from app.db.database import IS_SQLITE
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     if IS_SQLITE:
         return []
     emb_str = _emb_to_pgvector(embedding)
@@ -226,6 +227,7 @@ async def find_similar_concepts(
         WHERE user_id = :uid
           AND embedding IS NOT NULL
           AND 1 - (CAST(:emb AS vector({dim})) <=> embedding) >= :thr
+          {agent_scope_sql(agent_id)}
           AND (
             CASE WHEN :incl_expired THEN TRUE
                  ELSE (
@@ -251,6 +253,7 @@ async def find_similar_concepts(
         "thr": sim_thr,
         "incl_expired": include_expired,
         "in_bootstrap": active_concept_count < bootstrap_threshold,
+        **agent_scope_params(agent_id),
     })
     rows = result.fetchall()
     return [
@@ -267,8 +270,10 @@ async def find_similar_concepts(
 async def find_similar_episodes(
     db: AsyncSession, user_id: str, embedding: list[float], top_k: int = 5,
     include_expired: bool = False, time_start=None, time_end=None,
+    agent_id: str | None = None,
 ) -> list[dict]:
     from app.db.database import IS_SQLITE
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     if IS_SQLITE:
         return []
     emb_str = _emb_to_pgvector(embedding)
@@ -281,6 +286,7 @@ async def find_similar_episodes(
         WHERE user_id = :uid
           AND embedding IS NOT NULL
           AND 1 - (CAST(:emb AS vector({dim})) <=> embedding) >= :thr
+          {agent_scope_sql(agent_id)}
           AND (
             CASE WHEN :incl_expired THEN valid_from <= now()
                  ELSE valid_to IS NULL
@@ -299,6 +305,7 @@ async def find_similar_episodes(
         "incl_expired": include_expired,
         "ts": time_start,
         "te": time_end,
+        **agent_scope_params(agent_id),
     })
     rows = result.fetchall()
     return [
@@ -312,9 +319,10 @@ async def find_similar_episodes(
 
 async def find_similar_subconscious_units(
     db: AsyncSession, user_id: str, embedding: list[float], top_k: int = 10,
-    time_start=None, time_end=None,
+    time_start=None, time_end=None, agent_id: str | None = None,
 ) -> list[dict]:
     from app.db.database import IS_SQLITE
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     if IS_SQLITE:
         return []
     emb_str = _emb_to_pgvector(embedding)
@@ -328,6 +336,7 @@ async def find_similar_subconscious_units(
           AND created_at >= :since
           AND embedding IS NOT NULL
           AND 1 - (CAST(:emb AS vector({dim})) <=> embedding) >= :thr
+          {agent_scope_sql(agent_id)}
           AND (CAST(:ts AS TIMESTAMP) IS NULL OR created_at >= CAST(:ts AS TIMESTAMP))
           AND (CAST(:te AS TIMESTAMP) IS NULL OR created_at <= CAST(:te AS TIMESTAMP))
         ORDER BY CAST(:emb AS vector({dim})) <=> embedding
@@ -340,6 +349,7 @@ async def find_similar_subconscious_units(
         "thr": sim_thr,
         "ts": time_start,
         "te": time_end,
+        **agent_scope_params(agent_id),
     })
     rows = result.fetchall()
     return [
@@ -354,8 +364,10 @@ async def find_similar_subconscious_units(
 async def find_neighbors_for_unit(
     db: AsyncSession, user_id: str, unit_embedding: list[float],
     unit_id: str, unit_created_at, top_k: int = 5,
+    agent_id: str | None = None,
 ) -> list[dict]:
     from app.db.database import IS_SQLITE
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     if IS_SQLITE:
         return []
     emb_str = _emb_to_pgvector(unit_embedding)
@@ -369,6 +381,7 @@ async def find_neighbors_for_unit(
           AND promoted = FALSE
           AND created_at < :ts
           AND embedding IS NOT NULL
+          {agent_scope_sql(agent_id)}
         ORDER BY CAST(:emb AS vector({dim})) <=> embedding
         LIMIT :lim
     """)
@@ -378,6 +391,7 @@ async def find_neighbors_for_unit(
         "eid": unit_id,
         "ts": unit_created_at,
         "lim": top_k,
+        **agent_scope_params(agent_id),
     })
     rows = result.fetchall()
     return [

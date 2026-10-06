@@ -4,8 +4,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_current_user, get_db
+from app.core.deps import get_agent_scope, get_current_user, get_db
 from app.db.database import User
+from app.services.memory_scope import agent_scope_params, agent_scope_sql
 
 router = APIRouter(prefix="/api/memory", tags=["memory"])
 logger = logging.getLogger(__name__)
@@ -22,18 +23,19 @@ async def require_admin(current_user: User = Depends(get_current_user)) -> User:
 async def list_concepts(
     limit: int = 50,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        text("""
+        text(f"""
             SELECT id, canonical_name, description_short, description_full,
                    weight, importance, source_trust, memory_type, activation_strength,
-                   status, valid_from, valid_to, created_at
+                   status, valid_from, valid_to, created_at, agent_id
             FROM memory_concepts
-            WHERE user_id = :uid
+            WHERE user_id = :uid {agent_scope_sql(agent_id)}
             ORDER BY importance DESC, weight DESC, created_at DESC LIMIT :lim
         """),
-        {"uid": current_user.id, "lim": max(1, min(limit, 200))},
+        {"uid": current_user.id, "lim": max(1, min(limit, 200)), **agent_scope_params(agent_id)},
     )
     concepts = []
     for row in result.fetchall():
@@ -51,6 +53,7 @@ async def list_concepts(
             "valid_from": str(row[10]) if row[10] else None,
             "valid_to": str(row[11]) if row[11] else None,
             "created_at": str(row[12]) if row[12] else None,
+            "agent_id": row[13],
         })
     return {"concepts": concepts, "count": len(concepts)}
 
@@ -59,18 +62,19 @@ async def list_concepts(
 async def get_concept_detail(
     concept_id: str,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        text("""
+        text(f"""
             SELECT id, canonical_name, description_short, description_full,
                    weight, importance, source_trust, memory_type, activation_strength,
                    status, valid_from, valid_to, created_at, aliases,
-                   stability, last_recalled_at, metadata_json
+                   stability, last_recalled_at, metadata_json, agent_id
             FROM memory_concepts
-            WHERE id = :id AND user_id = :uid
+            WHERE id = :id AND user_id = :uid {agent_scope_sql(agent_id)}
         """),
-        {"id": concept_id, "uid": current_user.id},
+        {"id": concept_id, "uid": current_user.id, **agent_scope_params(agent_id)},
     )
     row = result.fetchone()
     if not row:
@@ -83,6 +87,7 @@ async def get_concept_detail(
         "valid_to": str(row[11]) if row[11] else None, "created_at": str(row[12]) if row[12] else None,
         "aliases": row[13], "stability": row[14],
         "last_recalled_at": str(row[15]) if row[15] else None, "metadata_json": row[16],
+        "agent_id": row[17],
     }
 
 
@@ -90,17 +95,18 @@ async def get_concept_detail(
 async def list_episodes(
     limit: int = 10,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        text("""
+        text(f"""
             SELECT id, narrative, source_unit_ids, source_type,
-                   valid_to, superseded_by, created_at
+                   valid_to, superseded_by, created_at, agent_id
             FROM memory_episodes
-            WHERE user_id = :uid
+            WHERE user_id = :uid {agent_scope_sql(agent_id)}
             ORDER BY (created_at IS NULL), created_at DESC LIMIT :lim
         """),
-        {"uid": current_user.id, "lim": max(1, min(limit, 50))},
+        {"uid": current_user.id, "lim": max(1, min(limit, 50)), **agent_scope_params(agent_id)},
     )
     episodes = []
     for row in result.fetchall():
@@ -110,6 +116,7 @@ async def list_episodes(
             "valid_to": str(row[4]) if row[4] else None,
             "superseded_by": row[5],
             "created_at": str(row[6]) if row[6] else None,
+            "agent_id": row[7],
         })
     return {"episodes": episodes, "count": len(episodes)}
 
@@ -118,18 +125,19 @@ async def list_episodes(
 async def list_dreams(
     limit: int = 10,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        text("""
+        text(f"""
             SELECT d.id, d.generated_for_date, d.summary, d.source_concept_count,
-                   d.source_cluster_count, d.dream_type, d.created_at
+                   d.source_cluster_count, d.dream_type, d.created_at, s.agent_id
             FROM agent_dreams d
             JOIN user_agent_states s ON d.agent_state_id = s.id
-            WHERE s.user_id = :uid
+            WHERE s.user_id = :uid {agent_scope_sql(agent_id, "s.agent_id")}
             ORDER BY (d.created_at IS NULL), d.created_at DESC, d.generated_for_date DESC LIMIT :lim
         """),
-        {"uid": current_user.id, "lim": max(1, min(limit, 50))},
+        {"uid": current_user.id, "lim": max(1, min(limit, 50)), **agent_scope_params(agent_id)},
     )
     dreams = []
     for row in result.fetchall():
@@ -141,6 +149,7 @@ async def list_dreams(
             "source_cluster_count": row[4],
             "dream_type": row[5],
             "created_at": str(row[6]) if row[6] else None,
+            "agent_id": row[7],
         })
     return {"dreams": dreams, "count": len(dreams)}
 
@@ -149,11 +158,12 @@ async def list_dreams(
 async def delete_concept(
     concept_id: str,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        text("DELETE FROM memory_concepts WHERE id = :id AND user_id = :uid RETURNING id"),
-        {"id": concept_id, "uid": current_user.id},
+        text(f"DELETE FROM memory_concepts WHERE id = :id AND user_id = :uid {agent_scope_sql(agent_id)} RETURNING id"),
+        {"id": concept_id, "uid": current_user.id, **agent_scope_params(agent_id)},
     )
     deleted = result.fetchone()
     if not deleted:
@@ -240,14 +250,17 @@ async def delete_all_memory(
     # 进程内缓存同步失效（GDPR 擦除彻底性：BM25 文档、会话缓存、复现滑窗）
     try:
         from app.services import memory_bm25 as _bm
-        for idx_map in (_bm._name_indexes, _bm._desc_indexes, _bm._epi_indexes, _bm._sub_indexes):
-            idx_map.pop(str(uid), None)
+        _bm.clear_indexes_for_user(str(uid))
     except Exception:
         pass
     try:
         from app.services import memory_retrieval_service as _rs
-        for key in [k for k in _rs._session_cache if k.startswith(f"{uid}:")]:
+        for key in [k for k in _rs._session_cache if str(k).startswith(f"{uid}:")]:
             _rs._session_cache.pop(key, None)
+        for key in [k for k in _rs._PROFILE_STABLE_CACHE if str(k).startswith(f"{uid}:")]:
+            _rs._PROFILE_STABLE_CACHE.pop(key, None)
+        for key in [k for k in _rs._text_injected_ids if str(k).startswith(f"{uid}:")]:
+            _rs._text_injected_ids.pop(key, None)
         for window in (_rs._concept_window, _rs._episodic_window, _rs._subconscious_window):
             window.pop(str(uid), None)
     except Exception:
@@ -259,18 +272,19 @@ async def delete_all_memory(
 async def list_clarifications(
     limit: int = 50,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     """§10.4：澄清记录列表（revert 端点的前置——用户需能看到已应用澄清的 ID）。"""
     result = await db.execute(
-        text("""
+        text(f"""
             SELECT id, original_text, correction_type, affected_concept_ids,
-                   new_description, confidence, applied, applied_at, created_at
+                   new_description, confidence, applied, applied_at, created_at, agent_id
             FROM memory_clarifications
-            WHERE user_id = :uid
+            WHERE user_id = :uid {agent_scope_sql(agent_id)}
             ORDER BY created_at DESC LIMIT :lim
         """),
-        {"uid": current_user.id, "lim": max(1, min(limit, 200))},
+        {"uid": current_user.id, "lim": max(1, min(limit, 200)), **agent_scope_params(agent_id)},
     )
     clarifications = []
     for row in result.fetchall():
@@ -284,6 +298,7 @@ async def list_clarifications(
             "applied": bool(row[6]),
             "applied_at": str(row[7]) if row[7] else None,
             "created_at": str(row[8]) if row[8] else None,
+            "agent_id": row[9],
         })
     return {"clarifications": clarifications, "count": len(clarifications)}
 
@@ -292,11 +307,12 @@ async def list_clarifications(
 async def revert_clarification_endpoint(
     clarification_id: str,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     """§9.6/§10.4：撤销已应用的澄清（negate 恢复有效；refine/add_constraint 回滚旧版本）。"""
     from app.services.memory_clarification_service import revert_clarification
-    ok = await revert_clarification(db, current_user.id, clarification_id)
+    ok = await revert_clarification(db, current_user.id, clarification_id, agent_id=agent_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Clarification not found, not applied, or irreversible (forget)")
     await db.commit()
@@ -307,11 +323,12 @@ async def revert_clarification_endpoint(
 async def apply_clarification_endpoint(
     clarification_id: str,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     """手动应用 pending 澄清（B-5：confidence < 0.8 落库后的人工确认途径）。"""
     from app.services.memory_clarification_service import apply_clarification
-    ok = await apply_clarification(db, current_user.id, clarification_id)
+    ok = await apply_clarification(db, current_user.id, clarification_id, agent_id=agent_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Clarification not found or already applied")
     await db.commit()
@@ -455,11 +472,12 @@ async def admin_migration_status(
 async def forget_concept(
     concept_id: str,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        text("UPDATE memory_concepts SET valid_to = CURRENT_TIMESTAMP, weight = 0, status = 'forgotten', updated_at = CURRENT_TIMESTAMP WHERE id = :id AND user_id = :uid RETURNING id"),
-        {"id": concept_id, "uid": current_user.id},
+        text(f"UPDATE memory_concepts SET valid_to = CURRENT_TIMESTAMP, weight = 0, status = 'forgotten', updated_at = CURRENT_TIMESTAMP WHERE id = :id AND user_id = :uid {agent_scope_sql(agent_id)} RETURNING id"),
+        {"id": concept_id, "uid": current_user.id, **agent_scope_params(agent_id)},
     )
     updated = result.fetchone()
     if not updated:
@@ -503,6 +521,7 @@ def get_config_memory_base() -> str:
 async def create_concept_endpoint(
     body: dict,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     """家族兼容端点：经 memory_concept_service.create_concept 写入服务层。
@@ -525,11 +544,12 @@ async def create_concept_endpoint(
         source_trust=str(body.get("source_trust") or "user_stated"),
         memory_type=str(body.get("memory_type") or "semantic"),
         source_type="manual",
+        agent_id=agent_id,
     )
     await db.commit()
     if not concept_id:
         raise HTTPException(status_code=500, detail="concept creation failed")
-    return {"id": concept_id, "canonical_name": canonical_name}
+    return {"id": concept_id, "canonical_name": canonical_name, "agent_id": agent_id}
 
 
 @router.post("/recall")
@@ -537,6 +557,7 @@ async def recall_endpoint(
     body: dict,
     include_meta: bool = False,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     """家族兼容端点：调用 memory_retrieval_service.retrieve_and_build_context。
@@ -553,10 +574,11 @@ async def recall_endpoint(
     mode = "embedding" if get_config_memory_base() else "text"
     if include_meta:
         from app.services.memory_retrieval_service import retrieve_with_meta
-        context, memory_ids, top_gate_score = await retrieve_with_meta(db, current_user.id, messages)
+        context, memory_ids, top_gate_score = await retrieve_with_meta(db, current_user.id, messages,
+                                                                       agent_id=agent_id)
         return {"mode": mode, "query": query, "context": context,
                 "meta": {"memory_ids": memory_ids, "top_gate_score": top_gate_score}}
-    context = await retrieve_and_build_context(db, current_user.id, messages)
+    context = await retrieve_and_build_context(db, current_user.id, messages, agent_id=agent_id)
     return {"mode": mode, "query": query, "context": context}
 
 
@@ -574,12 +596,14 @@ async def recall_endpoint(
 async def ingest_endpoint(
     body: dict,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     """潜意识摄入：文本写入 SubconsciousLog（PII scrub + embedding）。
 
     与 chatbot agent 工具同款语义；embedding provider 未配置时 503 显式降级
     （scan_recurrence 依赖向量邻居，无向量则摄入无意义）。
+    Wave 1：写入 agent_id 作用域 + conversation_id 会话归因。
     """
     content = str(body.get("content") or "").strip()
     if not content:
@@ -593,6 +617,7 @@ async def ingest_endpoint(
     if not isinstance(source_ids, list):
         raise HTTPException(status_code=422, detail="source_ids must be a list")
     source_ids = [str(s) for s in source_ids if str(s).strip()][:50]
+    conversation_id = str(body.get("conversation_id") or "").strip()[:64] or None
     if not get_config_memory_base():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -600,7 +625,8 @@ async def ingest_endpoint(
         )
 
     from app.services.memory_subconscious_service import ingest_raw_unit
-    unit_id = await ingest_raw_unit(db, current_user.id, unit_kind, content[:1000], source_ids)
+    unit_id = await ingest_raw_unit(db, current_user.id, unit_kind, content[:1000], source_ids,
+                                    agent_id=agent_id, conversation_id=conversation_id)
     await db.commit()
     if not unit_id:
         # provider 已配置但请求失败（网络/密钥/熔断）→ 502 上游依赖故障，可重试
@@ -608,13 +634,15 @@ async def ingest_endpoint(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="embedding provider request failed; ingestion not persisted",
         )
-    return {"unit_id": unit_id, "ingested": True}
+    return {"unit_id": unit_id, "ingested": True, "agent_id": agent_id,
+            "conversation_id": conversation_id}
 
 
 @router.post("/adoption")
 async def record_answer_adoption_endpoint(
     body: dict,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     """采纳反馈闭环（P1-①）：回答文本引用本轮注入概念名/别名 → 权重/边权 +0.02。
@@ -632,7 +660,8 @@ async def record_answer_adoption_endpoint(
     injected_ids = [str(s) for s in injected_ids if str(s).strip()][:50]
 
     from app.services.memory_adoption_service import record_answer_adoption
-    summary = await record_answer_adoption(db, current_user.id, injected_ids, answer_text)
+    summary = await record_answer_adoption(db, current_user.id, injected_ids, answer_text,
+                                           agent_id=agent_id)
     try:
         await db.commit()
     except Exception:
@@ -648,33 +677,36 @@ async def list_recall_log(
     before_id: str | None = None,
     limit: int = 50,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     """C1 召回台账读出：仅元数据（不含记忆内容），created_at 倒序游标分页。"""
     from sqlalchemy import text as _text
     limit = max(1, min(int(limit or 50), 200))
-    where = "user_id = :uid"
-    params: dict = {"uid": current_user.id, "lim": limit}
+    scope = agent_scope_sql(agent_id)
+    params: dict = {"uid": current_user.id, "lim": limit, **agent_scope_params(agent_id)}
+    where = f"user_id = :uid {scope}"
     if before_id:
         # 复合 keyset（created_at,id）——单 id 游标在 UUID 主键上会漏行/重行
-        where += (" AND (created_at, id) < (SELECT created_at, id FROM memory_recall_log "
-                  "WHERE id = :before AND user_id = :uid)")
+        where += (f" AND (created_at, id) < (SELECT created_at, id FROM memory_recall_log "
+                  f"WHERE id = :before AND user_id = :uid {scope})")
         params["before"] = str(before_id)
     rows = (await db.execute(_text(
         f"SELECT id, query_hash, candidate_ids, tier_scores, gate_score, budget_chars, "
-        f"injected_chars, truncated, elapsed_ms, cache_hit, created_at "
+        f"injected_chars, truncated, elapsed_ms, cache_hit, created_at, agent_id "
         f"FROM memory_recall_log WHERE {where} ORDER BY created_at DESC, id DESC LIMIT :lim"),
         params,
     )).fetchall()
     total = (await db.execute(_text(
-        "SELECT COUNT(*) FROM memory_recall_log WHERE user_id = :uid"),
-        {"uid": current_user.id},
+        f"SELECT COUNT(*) FROM memory_recall_log WHERE user_id = :uid {scope}"),
+        {"uid": current_user.id, **agent_scope_params(agent_id)},
     )).scalar() or 0
     items = [{
         "id": r[0], "query_hash": r[1], "candidate_ids": r[2], "tier_scores": r[3],
         "gate_score": r[4], "budget_chars": r[5], "injected_chars": r[6],
         "truncated": bool(r[7]), "elapsed_ms": r[8], "cache_hit": bool(r[9]),
         "created_at": (r[10].isoformat() if hasattr(r[10], "isoformat") else str(r[10])) if r[10] else None,
+        "agent_id": r[11],
     } for r in rows]
     return {"items": items, "total": total}
 
@@ -683,6 +715,7 @@ async def list_recall_log(
 async def process_clarification_endpoint(
     body: dict,
     current_user: User = Depends(get_current_user),
+    agent_id: str | None = Depends(get_agent_scope),
     db: AsyncSession = Depends(get_db),
 ):
     """澄清处理：detect_signal 规则预筛 → process_clarification（LLM 判定）。
@@ -704,5 +737,6 @@ async def process_clarification_endpoint(
         db, current_user.id, user_message,
         conversation_id=conversation_id,
         message_id=message_id,
+        agent_id=agent_id,
     )
     return {"detected": True, "clarification": result}

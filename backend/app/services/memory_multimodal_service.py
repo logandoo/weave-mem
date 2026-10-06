@@ -204,13 +204,15 @@ async def multimodal_locate_indices(
     return [int(i) for i in indices if isinstance(i, (int, float)) or (isinstance(i, str) and i.isdigit())]
 
 
-async def _load_recent_units(db: AsyncSession, user_id: str, top_k: int) -> list[dict]:
+async def _load_recent_units(db: AsyncSession, user_id: str, top_k: int,
+                             agent_id: str | None = None) -> list[dict]:
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     result = await db.execute(
         text(
-            "SELECT id, unit_kind, raw_text, created_at FROM subconscious_log"
-            " WHERE user_id = :uid ORDER BY created_at DESC LIMIT :k"
+            f"SELECT id, unit_kind, raw_text, created_at FROM subconscious_log"
+            f" WHERE user_id = :uid {agent_scope_sql(agent_id)} ORDER BY created_at DESC LIMIT :k"
         ),
-        {"uid": user_id, "k": top_k},
+        {"uid": user_id, "k": top_k, **agent_scope_params(agent_id)},
     )
     rows = result.fetchall()
     units = [
@@ -223,6 +225,7 @@ async def _load_recent_units(db: AsyncSession, user_id: str, top_k: int) -> list
 
 async def fallback_cold_start_context(
     db: AsyncSession, user_id: str, conversation_messages: list[dict],
+    agent_id: str | None = None,
 ) -> Optional[str]:
     """冷启动多模态 fallback 入口。失败（渲染/LLM/禁用）→ None（调用方回退）。"""
     if _failure_state["disabled"]:
@@ -232,7 +235,7 @@ async def fallback_cold_start_context(
     top_k = int(cfg.get("snapshot_top_k", 10))
     set_of_mark = bool(cfg.get("set_of_mark", True))
 
-    units = await _load_recent_units(db, user_id, top_k)
+    units = await _load_recent_units(db, user_id, top_k, agent_id=agent_id)
     if not units:
         return None
 

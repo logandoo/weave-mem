@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import json
 import logging
 import math
@@ -17,6 +18,27 @@ from app.services.memory_embedding_service import embed_text_cached, find_simila
 
 config = get_config()
 logger = logging.getLogger(__name__)
+
+# Wave 1：请求作用域内的 agent 命名空间（读路径单源）。入口函数设置；
+# fire-and-forget 任务继承创建时 context（asyncio.create_task 语义），
+# 台账归因显式传参不经此通道。
+_AGENT_SCOPE: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "memory_agent_scope", default=None)
+
+
+def _scope_sql(column: str = "agent_id") -> str:
+    from app.services.memory_scope import agent_scope_sql
+    return agent_scope_sql(_AGENT_SCOPE.get(), column)
+
+
+def _scope_params() -> dict:
+    from app.services.memory_scope import agent_scope_params
+    return agent_scope_params(_AGENT_SCOPE.get())
+
+
+def _scope_key() -> str:
+    return _AGENT_SCOPE.get() or ""
+
 
 def _now_expr() -> str:
     """当前时刻 SQL 表达式：PG 用 CURRENT_TIMESTAMP；SQLite 加 1 秒缓冲——
@@ -244,9 +266,9 @@ async def _drop_contradicted(
             text(f"""
                 SELECT source_id, target_id FROM concept_relations
                 WHERE user_id = :u AND relation_type = 'contradicts'
-                  AND {cond}
+                  AND {cond} {_scope_sql()}
             """),
-            {"u": user_id, **c_params},
+            {"u": user_id, **c_params, **_scope_params()},
         )
         pairs = [(r[0], r[1]) for r in result.fetchall()]
     except Exception:
@@ -274,7 +296,7 @@ def _apply_text_cross_turn_dedup(user_id: str, candidates: list) -> list:
     """D2：上一轮已注入的 id 本轮不重复注入；剩余 <2 时放弃过滤（防空注入）。"""
     if not config.memory_retrieval.get("text_cross_turn_dedup_enabled", False):
         return candidates
-    prev = _text_injected_ids.get(user_id) or set()
+    prev = _text_injected_ids.get(f"{user_id}:{_scope_key()}") or set()
     if not prev:
         return candidates
     kept = [c for c in candidates if c.id not in prev]
@@ -284,7 +306,7 @@ def _apply_text_cross_turn_dedup(user_id: str, candidates: list) -> list:
 def _remember_text_injected(user_id: str, memory_ids: list[str]) -> None:
     if not config.memory_retrieval.get("text_cross_turn_dedup_enabled", False):
         return
-    _text_injected_ids[user_id] = set(memory_ids or [])
+    _text_injected_ids[f"{user_id}:{_scope_key()}"] = set(memory_ids or [])
     if len(_text_injected_ids) > 200:
         for k in list(_text_injected_ids)[:100]:
             _text_injected_ids.pop(k, None)
@@ -295,11 +317,13 @@ _DEFAULT_USAGE_INSTRUCTION = "以上历史记忆可能过时或不适用于当�
 _TRUNCATION_NOTE = "\n\n（部分记忆因长度预算未完整展示）"
 
 
-def _spawn_recall_ledger(user_id: str, query_text: str, memory_ids, stats: dict) -> None:
-    """C1 台账发射（各召回出口统一；fire-and-forget fail-open）。"""
+def _spawn_recall_ledger(user_id: str, query_text: str, memory_ids, stats: dict,
+                         agent_id: Optional[str] = None) -> None:
+    """C1 台账发射（各召回出口统一；fire-and-forget fail-open）。Wave 1：归因 agent。"""
     try:
         from app.services.memory_recall_log_service import spawn_recall_log
-        spawn_recall_log(user_id, query_text, memory_ids=list(memory_ids or []), stats=stats)
+        spawn_recall_log(user_id, query_text, memory_ids=list(memory_ids or []), stats=stats,
+                         agent_id=agent_id)
     except Exception:
         logger.debug("recall log spawn failed (fail-open)", exc_info=True)
 
@@ -347,15 +371,15 @@ async def _stage2b_link_expansion(
             if added >= max_add:
                 break
             result = await db.execute(
-                text("SELECT id, canonical_name, description_short, description_full, "
-                     "weight, importance, source_trust, memory_type, aliases, "
-                     "last_recalled_at, stability, created_at "
-                     "FROM memory_concepts WHERE user_id = :u "
-                     "AND status IN ('active', 'silent') "
-                     "AND valid_to IS NULL "
-                     "AND source_unit_ids LIKE :pat "
-                     "ORDER BY weight DESC LIMIT 5"),
-                {"u": user_id, "pat": f'%"{seed.id}"%'},
+                text(f"SELECT id, canonical_name, description_short, description_full, "
+                     f"weight, importance, source_trust, memory_type, aliases, "
+                     f"last_recalled_at, stability, created_at "
+                     f"FROM memory_concepts WHERE user_id = :u "
+                     f"AND status IN ('active', 'silent') "
+                     f"AND valid_to IS NULL "
+                     f"AND source_unit_ids LIKE :pat {_scope_sql()} "
+                     f"ORDER BY weight DESC LIMIT 5"),
+                {"u": user_id, "pat": f'%"{seed.id}"%', **_scope_params()},
             )
             for row in result.fetchall():
                 if added >= max_add:
@@ -386,6 +410,7 @@ async def _stage2b_link_expansion(
 
 async def retrieve_with_meta(
     db: AsyncSession, user_id: str, conversation_messages: list[dict],
+    agent_id: Optional[str] = None,
 ) -> tuple[str, list[str], float]:
     """召回管线 + meta 读出（语音每轮召回用）。
 
@@ -393,7 +418,9 @@ async def retrieve_with_meta(
     上下文；memory_ids = 本轮检索命中注入的候选 id（跨轮去重用；不含恒定
     基底/总览/画像/dream 等非候选注入内容）；top_gate_score = 注入候选中
     的最高绝对相关分（记忆插话预筛门槛，0.0 = 无候选）。
+    Wave 1：agent_id 决定读作用域（NULL=共享命名空间，旧调用逐字节兼容）。
     """
+    _AGENT_SCOPE.set(agent_id)
     if not config.memory.get("retrieval_enabled", False):
         return await _fallback_context(db, user_id), [], 0.0
 
@@ -406,9 +433,9 @@ async def retrieve_with_meta(
                 query_text=""),
             [], 0.0)
 
-    # §5.2 工程要求 4：会话级缓存（最近 3 轮消息哈希，TTL 5 分钟）
+    # §5.2 工程要求 4：会话级缓存（最近 3 轮消息哈希，TTL 5 分钟；键含 agent 作用域）
     _t0 = time.monotonic()
-    cache_key = _session_cache_key(user_id, user_queries)
+    cache_key = _session_cache_key(user_id, user_queries, agent_id)
     cached = _session_cache_get(cache_key)
     if cached is not None:
         _cctx, _cids, _ctop, _cstats = cached
@@ -416,7 +443,7 @@ async def retrieve_with_meta(
         _st = dict(_cstats or {})
         _st["cache_hit"] = True
         _st.setdefault("elapsed_ms", (time.monotonic() - _t0) * 1000.0)
-        _spawn_recall_ledger(user_id, " ".join(user_queries), _cids, _st)
+        _spawn_recall_ledger(user_id, " ".join(user_queries), _cids, _st, agent_id=agent_id)
         return _cctx, _cids, _ctop
 
     query_text = " ".join(user_queries)
@@ -430,7 +457,7 @@ async def retrieve_with_meta(
             "gate_score": ttop,
             "budget_chars": int(config.memory_retrieval.get("injection_total_token_budget", 2000)),
             "injected_chars": len(tctx), "truncated": _TRUNCATION_NOTE in tctx,
-            "elapsed_ms": (time.monotonic() - _t0) * 1000.0, "cache_hit": False})
+            "elapsed_ms": (time.monotonic() - _t0) * 1000.0, "cache_hit": False}, agent_id=agent_id)
         return tctx, tids, ttop
 
     cold_start = await _is_cold_start(db, user_id)
@@ -442,7 +469,7 @@ async def retrieve_with_meta(
                 "gate_score": 0.0,
                 "budget_chars": int(config.memory_retrieval.get("injection_total_token_budget", 2000)),
                 "injected_chars": len(ctx), "truncated": _TRUNCATION_NOTE in ctx,
-                "elapsed_ms": (time.monotonic() - _t0) * 1000.0, "cache_hit": False})
+                "elapsed_ms": (time.monotonic() - _t0) * 1000.0, "cache_hit": False}, agent_id=agent_id)
             return ctx, [], 0.0
     candidates = await _stage1_bm25_search(db, user_id, stage0, cold_start)
 
@@ -546,15 +573,16 @@ async def retrieve_with_meta(
     }
     _session_cache_put(cache_key, ctx, (memory_ids, top_gate_score), stats=_ledger_stats)
     # C1 台账：fire-and-forget，仅元数据
-    _spawn_recall_ledger(user_id, " ".join(user_queries), memory_ids, _ledger_stats)
+    _spawn_recall_ledger(user_id, " ".join(user_queries), memory_ids, _ledger_stats, agent_id=agent_id)
     return ctx, memory_ids, top_gate_score
 
 
 async def retrieve_and_build_context(
     db: AsyncSession, user_id: str, conversation_messages: list[dict],
+    agent_id: Optional[str] = None,
 ) -> str:
     """文本通道入口——行为与重构前逐字节一致（仅委托 meta 版取 ctx）。"""
-    ctx, _ids, _top = await retrieve_with_meta(db, user_id, conversation_messages)
+    ctx, _ids, _top = await retrieve_with_meta(db, user_id, conversation_messages, agent_id=agent_id)
     return ctx
 
 
@@ -563,11 +591,13 @@ async def _fallback_context(db: AsyncSession, user_id: str) -> str:
 
     不在请求路径同步生成摘要（§1.2 #13：force 生成 = 2 次串行 LLM + 共享会话 commit，
     5-30s TTFT 阻塞）。摘要缺失时调度后台生成（独立会话），本轮返回已有内容。
+    Wave 1：读本作用域 UAS 行；agent 作用域不做 v1 摘要后台生成（来源=旧笔记/消息，
+    对 agent 无语义）。
     """
     try:
         result = await db.execute(
-            text("SELECT memory_summary, dream_summary FROM user_agent_states WHERE user_id = :uid"),
-            {"uid": user_id},
+            text(f"SELECT memory_summary, dream_summary FROM user_agent_states WHERE user_id = :uid {_scope_sql()} ORDER BY (agent_id IS NULL) ASC, updated_at DESC LIMIT 1"),
+            {"uid": user_id, **_scope_params()},
         )
         row = result.fetchone()
         memory_summary, dream_summary = (row[0], row[1]) if row else (None, None)
@@ -576,7 +606,7 @@ async def _fallback_context(db: AsyncSession, user_id: str) -> str:
             sections.append("共享长期记忆:\n" + memory_summary.strip()[:2000])
         if dream_summary:
             sections.append("近期 dream:\n" + dream_summary.strip()[:2000])
-        if not sections:
+        if not sections and not _scope_key():
             _schedule_summary_generation(user_id)
         return "\n\n".join(sections)
     except Exception:
@@ -626,8 +656,8 @@ def _extract_recent_user_queries(messages: list) -> list[str]:
 async def _is_cold_start(db: AsyncSession, user_id: str) -> bool:
     threshold = int(config.memory_retrieval.get("bootstrap_threshold", 10))
     result = await db.execute(
-        text("SELECT COUNT(*) FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 AND valid_to IS NULL"),
-        {"uid": user_id},
+        text(f"SELECT COUNT(*) FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 AND valid_to IS NULL {_scope_sql()}"),
+        {"uid": user_id, **_scope_params()},
     )
     count = result.scalar() or 0
     return count < threshold
@@ -636,8 +666,8 @@ async def _is_cold_start(db: AsyncSession, user_id: str) -> bool:
 async def _count_recallable_concepts(db: AsyncSession, user_id: str) -> int:
     """active + silent（valid_to IS NULL）概念总数——冷启动 Stage 1 放宽后的可召回池大小。"""
     result = await db.execute(
-        text("SELECT COUNT(*) FROM memory_concepts WHERE user_id = :uid AND status IN ('active','silent') AND valid_to IS NULL"),
-        {"uid": user_id},
+        text(f"SELECT COUNT(*) FROM memory_concepts WHERE user_id = :uid AND status IN ('active','silent') AND valid_to IS NULL {_scope_sql()}"),
+        {"uid": user_id, **_scope_params()},
     )
     return result.scalar() or 0
 
@@ -645,23 +675,23 @@ async def _count_recallable_concepts(db: AsyncSession, user_id: str) -> int:
 async def _has_recallable_subconscious(db: AsyncSession, user_id: str) -> bool:
     """近 30 天内有带 embedding 的 subconscious 单元（低数据用户原文检索兜底）。"""
     result = await db.execute(
-        text("""
+        text(f"""
             SELECT EXISTS (
                 SELECT 1 FROM subconscious_log
                 WHERE user_id = :uid AND embedding IS NOT NULL
-                  AND created_at >= :since
+                  AND created_at >= :since {_scope_sql()}
                 LIMIT 1
             )
         """),
-        {"uid": user_id, "since": datetime.utcnow() - timedelta(days=30)},
+        {"uid": user_id, "since": datetime.utcnow() - timedelta(days=30), **_scope_params()},
     )
     return bool(result.scalar())
 
 
 async def _is_migration_completed(db: AsyncSession, user_id: str) -> bool:
     result = await db.execute(
-        text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid"),
-        {"uid": user_id},
+        text(f"SELECT metadata_json FROM user_agent_states WHERE user_id = :uid {_scope_sql()} ORDER BY (agent_id IS NULL) ASC, updated_at DESC LIMIT 1"),
+        {"uid": user_id, **_scope_params()},
     )
     raw = result.scalar()
     if not raw:
@@ -705,7 +735,7 @@ async def _try_cold_start_fallback(
             from app.services import memory_multimodal_service
             try:
                 ctx = await memory_multimodal_service.fallback_cold_start_context(
-                    db, user_id, conversation_messages,
+                    db, user_id, conversation_messages, agent_id=_AGENT_SCOPE.get(),
                 )
             except Exception:
                 logger.warning("multimodal cold-start fallback error for user=%s", user_id, exc_info=True)
@@ -822,12 +852,12 @@ async def _stage1_bm25_search(
     from app.services.memory_weight_service import try_cold_resurrect
     candidates = []
 
-    await try_cold_resurrect(db, " ".join(stage0.keywords), user_id)
+    await try_cold_resurrect(db, " ".join(stage0.keywords), user_id, agent_id=_AGENT_SCOPE.get())
 
     query_str = " ".join(stage0.keywords)
 
     try:
-        name_idx = await get_name_index(db, user_id)
+        name_idx = await get_name_index(db, user_id, _AGENT_SCOPE.get())
         for doc_id, score in name_idx.search(query_str, k=int(config.memory_retrieval.get("stage1_concept_top_k", 30))):
             detail = await _get_concept_detail(db, doc_id, user_id, include_expired=stage0.include_expired)
             if not detail:
@@ -863,9 +893,9 @@ async def _stage1_bm25_search(
         logger.exception("Stage 1 concept BM25 failed")
 
     try:
-        epi_idx = await get_epi_index(db, user_id)
+        epi_idx = await get_epi_index(db, user_id, _AGENT_SCOPE.get())
         for doc_id, score in epi_idx.search(query_str, k=int(config.memory_retrieval.get("stage1_episodic_top_k", 5))):
-            detail = await _get_episode_detail(db, doc_id, include_expired=stage0.include_expired)
+            detail = await _get_episode_detail(db, doc_id, user_id, include_expired=stage0.include_expired)
             if detail:
                 candidates.append(RetrievalCandidate(
                     id=doc_id, tier="episodic", score=score,
@@ -879,9 +909,9 @@ async def _stage1_bm25_search(
         logger.exception("Stage 1 episodic BM25 failed")
 
     try:
-        sub_idx = await get_sub_index(db, user_id)
+        sub_idx = await get_sub_index(db, user_id, _AGENT_SCOPE.get())
         for doc_id, score in sub_idx.search(query_str, k=int(config.memory_retrieval.get("stage1_subconscious_top_k", 10))):
-            detail = await _get_subconscious_detail(db, doc_id)
+            detail = await _get_subconscious_detail(db, doc_id, user_id)
             if detail:
                 candidates.append(RetrievalCandidate(
                     id=doc_id, tier="subconscious", score=score,
@@ -921,10 +951,10 @@ _SESSION_CACHE_TTL = 300.0
 _EMPTY_META: tuple[list, float] = ([], 0.0)
 
 
-def _session_cache_key(user_id: str, user_queries: list[str]) -> str:
+def _session_cache_key(user_id: str, user_queries: list[str], agent_id: Optional[str] = None) -> str:
     import hashlib
     h = hashlib.sha1(("|".join(user_queries[-3:])).encode("utf-8")).hexdigest()[:16]
-    return f"{user_id}:{h}"
+    return f"{user_id}:{agent_id or ''}:{h}"
 
 
 def _session_cache_get(key: str) -> Optional[tuple[str, list, float, dict]]:
@@ -1004,10 +1034,10 @@ async def _temporal_list_shortcut(
     ids: list[str] = []
 
     epi_r = await db.execute(
-        text("""SELECT id, narrative, valid_from FROM memory_episodes
-                WHERE user_id = :uid AND valid_to IS NULL
+        text(f"""SELECT id, narrative, valid_from FROM memory_episodes
+                WHERE user_id = :uid AND valid_to IS NULL {_scope_sql()}
                 ORDER BY (valid_from IS NULL), valid_from DESC LIMIT 10"""),
-        {"uid": user_id},
+        {"uid": user_id, **_scope_params()},
     )
     episodes = epi_r.fetchall()
     if episodes:
@@ -1019,11 +1049,11 @@ async def _temporal_list_shortcut(
 
     if len(episodes) < 5:
         con_r = await db.execute(
-            text("""SELECT id, canonical_name, description_short, aliases, weight, source_trust
+            text(f"""SELECT id, canonical_name, description_short, aliases, weight, source_trust
                     FROM memory_concepts
-                    WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 AND valid_to IS NULL
+                    WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 AND valid_to IS NULL {_scope_sql()}
                     ORDER BY (last_recalled_at IS NULL), last_recalled_at DESC LIMIT 8"""),
-            {"uid": user_id},
+            {"uid": user_id, **_scope_params()},
         )
         concepts = con_r.fetchall()
         if concepts:
@@ -1039,10 +1069,10 @@ async def _temporal_list_shortcut(
 
     if len(episodes) + (0 if concept_count == 99 else concept_count) < 8:
         sub_r = await db.execute(
-            text("""SELECT id, raw_text, created_at FROM subconscious_log
-                    WHERE user_id = :uid AND created_at >= :since AND embedding IS NOT NULL
+            text(f"""SELECT id, raw_text, created_at FROM subconscious_log
+                    WHERE user_id = :uid AND created_at >= :since AND embedding IS NOT NULL {_scope_sql()}
                     ORDER BY created_at DESC LIMIT 10"""),
-            {"uid": user_id, "since": datetime.utcnow() - timedelta(days=30)},
+            {"uid": user_id, "since": datetime.utcnow() - timedelta(days=30), **_scope_params()},
         )
         subs = sub_r.fetchall()
         if subs:
@@ -1067,7 +1097,7 @@ async def _get_concept_detail(
     db: AsyncSession, concept_id: str, user_id: str, include_expired: bool = False,
 ) -> dict | None:    # §5.2 as-of 历史查询：include_expired 时不过滤 valid_to（失效概念可查，注入时标注）
     validity = f"valid_from <= {_now_expr()}" if include_expired else "valid_to IS NULL"
-    result = await db.execute(text(f"SELECT canonical_name, description_short, description_full, weight, source_trust, memory_type, aliases, activation_strength, status, last_recalled_at, stability, created_at, valid_to, importance FROM memory_concepts WHERE id = :id AND user_id = :uid AND {validity}"), {"id": concept_id, "uid": user_id})
+    result = await db.execute(text(f"SELECT canonical_name, description_short, description_full, weight, source_trust, memory_type, aliases, activation_strength, status, last_recalled_at, stability, created_at, valid_to, importance FROM memory_concepts WHERE id = :id AND user_id = :uid AND {validity} {_scope_sql()}"), {"id": concept_id, "uid": user_id, **_scope_params()})
     row = result.fetchone()
     if not row:
         return None
@@ -1080,18 +1110,19 @@ async def _get_concept_detail(
     }
 
 
-async def _get_episode_detail(db: AsyncSession, episode_id: str, include_expired: bool = False) -> dict | None:
+async def _get_episode_detail(db: AsyncSession, episode_id: str, user_id: str,
+                              include_expired: bool = False) -> dict | None:
     # §5.2 as-of：include_expired 时不过滤 valid_to/superseded_by
     validity = f"valid_from <= {_now_expr()}" if include_expired else "(valid_to IS NULL OR superseded_by IS NULL)"
-    result = await db.execute(text(f"SELECT narrative, valid_from, source_concept_ids FROM memory_episodes WHERE id = :id AND {validity}"), {"id": episode_id})
+    result = await db.execute(text(f"SELECT narrative, valid_from, source_concept_ids FROM memory_episodes WHERE id = :id AND user_id = :uid AND {validity} {_scope_sql()}"), {"id": episode_id, "uid": user_id, **_scope_params()})
     row = result.fetchone()
     if not row:
         return None
     return {"narrative": row[0], "valid_from": row[1], "source_concept_ids": row[2]}
 
 
-async def _get_subconscious_detail(db: AsyncSession, unit_id: str) -> dict | None:
-    result = await db.execute(text("SELECT raw_text, created_at, recurrence_count FROM subconscious_log WHERE id = :id"), {"id": unit_id})
+async def _get_subconscious_detail(db: AsyncSession, unit_id: str, user_id: str) -> dict | None:
+    result = await db.execute(text(f"SELECT raw_text, created_at, recurrence_count FROM subconscious_log WHERE id = :id AND user_id = :uid {_scope_sql()}"), {"id": unit_id, "uid": user_id, **_scope_params()})
     row = result.fetchone()
     if not row:
         return None
@@ -1111,7 +1142,7 @@ async def _stage2_description_expansion(
     query_str = " ".join(stage0.keywords)
 
     try:
-        desc_idx = await get_desc_index(db, user_id)
+        desc_idx = await get_desc_index(db, user_id, _AGENT_SCOPE.get())
         for doc_id, score in desc_idx.search(query_str, k=int(ret_cfg.get("stage2_concept_top_k", 15))):
             existing = [c for c in candidates if c.id == doc_id]
             if not existing:
@@ -1141,8 +1172,8 @@ async def _stage2_description_expansion(
             clusters = await get_clusters_for_concepts(db, concept_ids[:10])
             for cluster in clusters:
                 result = await db.execute(
-                    text("SELECT mc.id FROM memory_concepts mc JOIN concept_cluster_members ccm ON mc.id = ccm.concept_id WHERE ccm.cluster_id = :clid AND mc.id != ALL(:existing) LIMIT 10"),
-                    {"clid": cluster["id"], "existing": [c.id for c in candidates if c.tier == "concept"]},
+                    text(f"SELECT mc.id FROM memory_concepts mc JOIN concept_cluster_members ccm ON mc.id = ccm.concept_id WHERE ccm.cluster_id = :clid AND mc.id != ALL(:existing) {_scope_sql('mc.agent_id')} LIMIT 10"),
+                    {"clid": cluster["id"], "existing": [c.id for c in candidates if c.tier == "concept"], **_scope_params()},
                 )
                 for row in result.fetchall():
                     detail = await _get_concept_detail(db, row[0], user_id, include_expired=stage0.include_expired)
@@ -1187,7 +1218,8 @@ async def _stage2_description_expansion(
                 if added >= max_new:
                     break
                 neighbors = await get_neighbors(db, seed.id, min_weight=min_edge_w,
-                                                allowed_types=whitelist)
+                                                allowed_types=whitelist,
+                                                agent_id=_AGENT_SCOPE.get())
                 for nb in neighbors[:max_neighbors]:
                     if added >= max_new:
                         break
@@ -1226,7 +1258,8 @@ async def _stage2_description_expansion(
                         break
                     try:
                         hop2 = await get_neighbors(db, parent_id, min_weight=min_edge_w,
-                                                   allowed_types=whitelist)
+                                                   allowed_types=whitelist,
+                                                   agent_id=_AGENT_SCOPE.get())
                     except Exception:
                         continue
                     for nb in hop2[:2]:
@@ -1285,6 +1318,7 @@ async def _stage3_embedding_rerank(
             top_k=int(ret_cfg.get("retrieval_k_concept", 10)),
             include_expired=stage0.include_expired,
             active_concept_count=active_count, bootstrap_threshold=bootstrap,
+            agent_id=_AGENT_SCOPE.get(),
         )
     except Exception:
         concept_results = []
@@ -1296,6 +1330,7 @@ async def _stage3_embedding_rerank(
             include_expired=stage0.include_expired,
             time_start=stage0.time_range[0] if stage0.time_range else None,
             time_end=stage0.time_range[1] if stage0.time_range else None,
+            agent_id=_AGENT_SCOPE.get(),
         )
     except Exception:
         epi_results = []
@@ -1306,6 +1341,7 @@ async def _stage3_embedding_rerank(
             top_k=10,
             time_start=stage0.time_range[0] if stage0.time_range else None,
             time_end=stage0.time_range[1] if stage0.time_range else None,
+            agent_id=_AGENT_SCOPE.get(),
         )
     except Exception:
         sub_results = []
@@ -1958,10 +1994,10 @@ async def _build_memory_overview(
                 "FROM memory_concepts "
                 "WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 "
                 "AND valid_to IS NULL AND (valid_from IS NULL OR valid_from <= " + _now_expr() + ") "
-                "AND memory_type != 'profile' AND weight > 0.05 "
+                "AND memory_type != 'profile' AND weight > 0.05 " + _scope_sql() + " "
                 "ORDER BY " + eff_expr + " DESC, created_at DESC LIMIT :limit"
             ),
-            {"uid": user_id, "limit": max_concepts},
+            {"uid": user_id, "limit": max_concepts, **_scope_params()},
         )
         rows = result.fetchall()
     except Exception:
@@ -1996,10 +2032,10 @@ async def _build_memory_overview(
             text(
                 "SELECT narrative, valid_from, id FROM memory_episodes "
                 "WHERE user_id = :uid AND valid_to IS NULL AND superseded_by IS NULL "
-                "AND (valid_from IS NULL OR valid_from <= " + _now_expr() + ") "
+                "AND (valid_from IS NULL OR valid_from <= " + _now_expr() + ") " + _scope_sql() + " "
                 "ORDER BY (valid_from IS NULL), valid_from DESC, created_at DESC LIMIT :limit"
             ),
-            {"uid": user_id, "limit": max_episodes},
+            {"uid": user_id, "limit": max_episodes, **_scope_params()},
         )
         epi_rows = result.fetchall()
     except Exception:
@@ -2182,7 +2218,7 @@ async def _build_injection_context(
 
     try:
         from app.services.memory_clarification_service import get_recent_clarifications
-        clarifications = await get_recent_clarifications(db, user_id, days=3)
+        clarifications = await get_recent_clarifications(db, user_id, days=3, agent_id=_AGENT_SCOPE.get())
     except Exception:
         logger.debug("load clarifications failed", exc_info=True)
         clarifications = []
@@ -2289,15 +2325,15 @@ async def _get_latest_dream(db: AsyncSession, user_id: str) -> str | None:
     # A4.9 复审 Minor：runtime 禁用（v1 模式）时 consolidation 调度停止、v1 行被
     # nightly 过滤 → 本函数返回空——退回任意类型最新行（v1 模式无注入歧义）。
     result = await db.execute(
-        text("SELECT summary FROM agent_dreams WHERE agent_state_id = (SELECT id FROM user_agent_states WHERE user_id = :uid) AND dream_type = 'consolidation' ORDER BY (created_at IS NULL), created_at DESC, generated_for_date DESC LIMIT 1"),
-        {"uid": user_id},
+        text(f"SELECT summary FROM agent_dreams WHERE agent_state_id = (SELECT id FROM user_agent_states WHERE user_id = :uid {_scope_sql()} ORDER BY (agent_id IS NULL) ASC LIMIT 1) AND dream_type = 'consolidation' ORDER BY (created_at IS NULL), created_at DESC, generated_for_date DESC LIMIT 1"),
+        {"uid": user_id, **_scope_params()},
     )
     row = result.fetchone()
     if row:
         return row[0]
     result = await db.execute(
-        text("SELECT summary FROM agent_dreams WHERE agent_state_id = (SELECT id FROM user_agent_states WHERE user_id = :uid) ORDER BY (created_at IS NULL), created_at DESC, generated_for_date DESC LIMIT 1"),
-        {"uid": user_id},
+        text(f"SELECT summary FROM agent_dreams WHERE agent_state_id = (SELECT id FROM user_agent_states WHERE user_id = :uid {_scope_sql()} ORDER BY (agent_id IS NULL) ASC LIMIT 1) ORDER BY (created_at IS NULL), created_at DESC, generated_for_date DESC LIMIT 1"),
+        {"uid": user_id, **_scope_params()},
     )
     row = result.fetchone()
     return row[0] if row else None
@@ -2326,7 +2362,8 @@ async def _filter_stable_profile_lines(summary: str, user_id: str) -> list[str]:
     if not lines:
         return []
     now = time.monotonic()
-    cached = _PROFILE_STABLE_CACHE.get(user_id)
+    cache_key = f"{user_id}:{_scope_key()}"
+    cached = _PROFILE_STABLE_CACHE.get(cache_key)
     if cached and now - cached[0] < 600:
         return cached[1]
     try:
@@ -2347,7 +2384,7 @@ async def _filter_stable_profile_lines(summary: str, user_id: str) -> list[str]:
             stable = [ln for ln in lines if ln in chosen]
         if len(_PROFILE_STABLE_CACHE) > 512:
             _PROFILE_STABLE_CACHE.clear()
-        _PROFILE_STABLE_CACHE[user_id] = (now, stable)
+        _PROFILE_STABLE_CACHE[cache_key] = (now, stable)
         return stable
     except Exception as exc:
         logger.warning("stable-profile LLM filter failed: %s", exc)
@@ -2369,7 +2406,7 @@ async def _get_profile_summary(db: AsyncSession, user_id: str, max_chars: int = 
     lines: list[str] = []
     try:
         from app.services.memory_profile_service import get_profile_concepts
-        facts = await get_profile_concepts(db, user_id, limit=6)
+        facts = await get_profile_concepts(db, user_id, limit=6, agent_id=_AGENT_SCOPE.get())
         for f in facts:
             name = (f.get("name") or "").strip()
             desc = (f.get("desc") or "").strip()
@@ -2385,8 +2422,8 @@ async def _get_profile_summary(db: AsyncSession, user_id: str, max_chars: int = 
     # 裁剪判断由 LLM 完成（agentic 原则，原 _CHANGE_RE 正则已删除）。
     if not lines:
         result = await db.execute(
-            text("SELECT memory_summary FROM user_agent_states WHERE user_id = :uid AND memory_summary IS NOT NULL"),
-            {"uid": user_id},
+            text(f"SELECT memory_summary FROM user_agent_states WHERE user_id = :uid AND memory_summary IS NOT NULL {_scope_sql()} ORDER BY (agent_id IS NULL) ASC, updated_at DESC LIMIT 1"),
+            {"uid": user_id, **_scope_params()},
         )
         row = result.fetchone()
         if row and (row[0] or "").strip():
@@ -2406,7 +2443,7 @@ async def _get_profile_summary(db: AsyncSession, user_id: str, max_chars: int = 
 
 async def _count_active_concepts(db: AsyncSession, user_id: str) -> int:
     result = await db.execute(
-        text("SELECT COUNT(*) FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 AND valid_to IS NULL"),
-        {"uid": user_id},
+        text(f"SELECT COUNT(*) FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 AND valid_to IS NULL {_scope_sql()}"),
+        {"uid": user_id, **_scope_params()},
     )
     return result.scalar() or 0

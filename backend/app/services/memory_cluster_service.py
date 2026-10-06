@@ -44,11 +44,11 @@ async def get_clusters_for_concepts(db: AsyncSession, concept_ids: list[str]) ->
 async def create_relation(
     db: AsyncSession, user_id: str, source_id: str, target_id: str,
     relation_type: str, description: str = "", weight: float = 0.5,
-    edge_source: str = "llm",
+    edge_source: str = "llm", agent_id: str | None = None,
 ) -> str:
     rid = str(uuid.uuid4())
     relation = ConceptRelation(
-        id=rid, user_id=user_id, source_id=source_id, target_id=target_id,
+        id=rid, user_id=user_id, agent_id=agent_id, source_id=source_id, target_id=target_id,
         relation_type=relation_type, description=description, weight=weight,
         edge_source=edge_source or "llm",
     )
@@ -59,11 +59,12 @@ async def create_relation(
 
 async def get_neighbors(
     db: AsyncSession, concept_id: str, min_weight: float = 0.3,
-    allowed_types: list[str] | None = None,
+    allowed_types: list[str] | None = None, agent_id: str | None = None,
 ) -> list[dict]:
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     result = await db.execute(
-        text("SELECT target_id, relation_type, weight FROM concept_relations WHERE source_id = :id AND weight >= :mw UNION ALL SELECT source_id, relation_type, weight FROM concept_relations WHERE target_id = :id AND weight >= :mw"),
-        {"id": concept_id, "mw": min_weight},
+        text(f"SELECT target_id, relation_type, weight FROM concept_relations WHERE source_id = :id AND weight >= :mw {agent_scope_sql(agent_id)} UNION ALL SELECT source_id, relation_type, weight FROM concept_relations WHERE target_id = :id AND weight >= :mw {agent_scope_sql(agent_id)}"),
+        {"id": concept_id, "mw": min_weight, **agent_scope_params(agent_id)},
     )
     rows = [{"id": r[0], "relation_type": r[1], "weight": r[2]} for r in result.fetchall()]
     # D1（门 edge_read_whitelist_enabled）：读侧边类型白名单过滤
@@ -93,6 +94,7 @@ def edge_read_whitelist(cfg: dict) -> list[str] | None:
 
 async def build_deterministic_edges(
     db: AsyncSession, user_id: str, concept_ids: list[str], max_edges: int = 20,
+    agent_id: str | None = None,
 ) -> int:
     """D1：LLM-free 共现边（同 source_unit_ids 窗口内概念两两建边）。
 
@@ -136,7 +138,8 @@ async def build_deterministic_edges(
                     continue
                 await create_relation(
                     db, user_id, a, b, DETERMINISTIC_EDGE_TYPE,
-                    description="co-occurrence", weight=0.5, edge_source=DETERMINISTIC_EDGE_TYPE)
+                    description="co-occurrence", weight=0.5, edge_source=DETERMINISTIC_EDGE_TYPE,
+                    agent_id=agent_id)
                 created += 1
     except Exception:
         logger.debug("build_deterministic_edges failed (fail-open)", exc_info=True)

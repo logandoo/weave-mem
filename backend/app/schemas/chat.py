@@ -13,6 +13,8 @@ class UserResponse(BaseModel):
 class LoginRequest(BaseModel):
     username: str
     password: str
+    # Wave 1：可选 agent 身份（JWT 即携带作用域；缺省 None = 共享作用域）
+    agent_id: Optional[str] = None
 
 
 class TokenResponse(BaseModel):

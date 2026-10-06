@@ -1,0 +1,22 @@
+{
+  "name": "@weave-mem/dsh-memory-plugin",
+  "version": "0.1.0",
+  "description": "weave-mem long-term memory for DeepSeek Harness (dsh): pre-step recall injection + session event capture.",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "memory",
+    "weave-mem",
+    "cordis"
+  ],
+  "license": "MIT"
+}

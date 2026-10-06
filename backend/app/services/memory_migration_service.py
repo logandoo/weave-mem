@@ -96,7 +96,7 @@ def _new_progress() -> dict:
 async def _load_progress(db: AsyncSession, user_id: str) -> tuple[dict, dict]:
     # FOR UPDATE：与 cost_governance _save_level 串行化 metadata_json 读-改-写（防互丢更新）
     result = await db.execute(
-        text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid"
+        text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL"
          + (" FOR UPDATE" if not _IS_SQLITE_CM() else "")),
         {"uid": user_id},
     )
@@ -108,7 +108,7 @@ async def _load_progress(db: AsyncSession, user_id: str) -> tuple[dict, dict]:
 async def _save_progress(db: AsyncSession, user_id: str, meta: dict, progress: dict) -> None:
     meta["migration"] = progress
     await db.execute(
-        text("UPDATE user_agent_states SET metadata_json = :meta WHERE user_id = :uid"),
+        text("UPDATE user_agent_states SET metadata_json = :meta WHERE user_id = :uid AND agent_id IS NULL"),
         {"meta": json.dumps(meta, ensure_ascii=False), "uid": user_id},
     )
 
@@ -511,7 +511,7 @@ async def reconcile_migration(db: AsyncSession, user_id: str) -> dict:
     failures: list[str] = []
 
     state_r = await db.execute(
-        text("SELECT memory_summary FROM user_agent_states WHERE user_id = :uid"),
+        text("SELECT memory_summary FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL"),
         {"uid": user_id},
     )
     memory_summary = state_r.scalar()
@@ -553,7 +553,7 @@ async def reconcile_migration(db: AsyncSession, user_id: str) -> dict:
 
     # 覆盖率：已迁移键数 / 应迁移条目数 ≥ 99%
     state_r2 = await db.execute(
-        text("SELECT id FROM user_agent_states WHERE user_id = :uid"),
+        text("SELECT id FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL"),
         {"uid": user_id},
     )
     sid = state_r2.scalar()
@@ -587,7 +587,7 @@ async def reconcile_migration(db: AsyncSession, user_id: str) -> dict:
 async def migrate_user_dry_run(db: AsyncSession, user_id: str) -> dict:
     """§8.5.4 dry-run：只读统计不写库（各来源条目数/待迁移数/预计 LLM 调用数）。"""
     state_r = await db.execute(
-        text("SELECT id, memory_summary, dream_summary FROM user_agent_states WHERE user_id = :uid"),
+        text("SELECT id, memory_summary, dream_summary FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL"),
         {"uid": user_id},
     )
     row = state_r.fetchone()
@@ -668,7 +668,7 @@ async def rollback_user(user_id: str) -> dict:
                 {"uid": user_id},
             )
             await db.execute(
-                text("DELETE FROM agent_dreams WHERE agent_state_id IN (SELECT id FROM user_agent_states WHERE user_id = :uid) AND dream_type = 'legacy'"),
+                text("DELETE FROM agent_dreams WHERE agent_state_id IN (SELECT id FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL) AND dream_type = 'legacy'"),
                 {"uid": user_id},
             )
             meta, _ = await _load_progress(db, user_id)
@@ -681,7 +681,7 @@ async def rollback_user(user_id: str) -> dict:
                         last_note_processed_at = NULL, last_message_processed_at = NULL,
                         last_file_memory_processed_at = NULL, last_subconscious_scan_at = NULL,
                         last_consolidation_at = NULL, total_concept_count = 0, total_episode_count = 0
-                        WHERE user_id = :uid"""),
+                        WHERE user_id = :uid AND agent_id IS NULL"""),
                 {"meta": json.dumps(meta, ensure_ascii=False), "uid": user_id},
             )
             await db.commit()
@@ -704,7 +704,7 @@ async def migrate_user(user_id: str, dry_run: bool = False) -> str:
             return "locked"
         try:
             state_r = await db.execute(
-                text("SELECT id, memory_summary, dream_summary, metadata_json FROM user_agent_states WHERE user_id = :uid"),
+                text("SELECT id, memory_summary, dream_summary, metadata_json FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL"),
                 {"uid": user_id},
             )
             row = state_r.fetchone()
@@ -786,7 +786,7 @@ async def enqueue_pending_migrations() -> dict:
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            text("SELECT user_id, metadata_json FROM user_agent_states")
+            text("SELECT user_id, metadata_json FROM user_agent_states WHERE agent_id IS NULL")
         )
         candidates: list[str] = []
         for uid, raw in result.fetchall():
@@ -842,11 +842,11 @@ async def get_migration_status(user_id: str | None = None) -> list[dict]:
     async with AsyncSessionLocal() as db:
         if user_id:
             result = await db.execute(
-                text("SELECT user_id, metadata_json FROM user_agent_states WHERE user_id = :uid"),
+                text("SELECT user_id, metadata_json FROM user_agent_states WHERE user_id = :uid AND agent_id IS NULL"),
                 {"uid": user_id},
             )
         else:
-            result = await db.execute(text("SELECT user_id, metadata_json FROM user_agent_states"))
+            result = await db.execute(text("SELECT user_id, metadata_json FROM user_agent_states WHERE agent_id IS NULL"))
         out = []
         for uid, raw in result.fetchall():
             meta = _parse_metadata(raw)

@@ -261,6 +261,42 @@ curl -sS -X DELETE http://127.0.0.1:8202/api/auth/tokens/<id> -H "Authorization:
 
 Endpoints: `POST /api/auth/tokens` (create), `GET /api/auth/tokens` (list), `DELETE /api/auth/tokens/{id}` (revoke).
 
+## Agent Scope (multi-agent memory namespaces)
+
+Multiple agents (Claude Code, Codex, OpenCode, DeepSeek Harness, scripts…) can share one user account without polluting each other's memory:
+
+- **Shared vs private** — `agent_id IS NULL` rows are user-level shared memory (visible to every agent and to legacy clients); non-NULL rows are private to that agent. Reads see `shared + own`; writes are stamped with the caller's agent.
+- **How to set the scope** — per-request header `X-Agent-Id: <key>` (`[A-Za-z0-9._-]{1,64}`; invalid → 422), or bind it at token creation: `POST /api/auth/tokens {"name":"claude-code","agent_id":"claude-code"}`, or `POST /api/auth/login {"agent_id":"…"}`. Header wins over token binding.
+- **MCP** — each harness launches its own MCP process with `WEAVE_MEM_AGENT_ID=<key>` (or `[mcp] agent_id` in config.toml).
+- **SDK** — `MemoryClient(base_url, token=..., agent_id="claude-code")`.
+- **Attribution** — `memory_recall_log` and `concepts`/`episodes`/`clarifications` list responses carry `agent_id`; the scheduler runs consolidation/scan per `(user, agent)` scope and merges only within one scope.
+
+```bash
+# write as agent "claude-code", read back only that scope (+ shared)
+curl -sS -X POST http://127.0.0.1:8202/api/memory/concepts \
+  -H "Authorization: Bearer $PAT" -H "X-Agent-Id: claude-code" \
+  -H 'Content-Type: application/json' -d '{"canonical_name":"editor","description_short":"prefers Vim"}'
+```
+
+## Agent Integrations (Claude Code / Codex / OpenCode / DeepSeek Harness)
+
+Lifecycle plugins in `integrations/` add automatic recall + capture beyond MCP —
+no model tool calls needed. Each harness runs under its own agent scope
+(`X-Agent-Id`), so memories do not mix.
+
+| Harness | Path | Mechanism |
+|---|---|---|
+| Claude Code | `integrations/claude-code` | hooks: `UserPromptSubmit` recall, `Stop`/`PreCompact`/`SessionEnd`/`SubagentStop` capture, `.mcp.json` for tools |
+| Codex | `integrations/codex` | same hook core, Codex output contract (`{}` no-op, no `decision:approve`) |
+| OpenCode | `integrations/opencode` | plugin (`chat.message` recall, `session.idle` capture); V2 `setup()` beta |
+| DeepSeek Harness | `integrations/dsh` | Cordis plugin (`agent/pre-step` merged recall message, `session/event` capture, durable pending queue) — verified end-to-end against dsh 0.1.5-rc |
+| Shared core | `integrations/shared` | zero-dep `.mjs`: config/client/recall-block/capture/state + selftest |
+
+Install and configuration per harness: see each `integrations/*/README.md`.
+Capture is a single `POST /api/memory/ingest` per turn (recurrence-gated
+promotion — no session/commit machinery); injected `<weave-mem-context>`
+blocks are stripped from capture; everything fails open.
+
 ## OpenAPI Spec
 
 - At runtime: `http://127.0.0.1:8202/docs` (Swagger UI) / `/openapi.json`

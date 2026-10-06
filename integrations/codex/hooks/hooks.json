@@ -1,0 +1,61 @@
+{
+  "description": "weave-mem lifecycle hooks for Codex. Commands use ${CODEX_PLUGIN_ROOT:-$HOME/.weave-mem/plugins/weave-mem/integrations} so they work with or without plugin-root expansion; see README route A/B.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CODEX_PLUGIN_ROOT:-$HOME/.weave-mem/plugins/weave-mem/integrations}/shared/hooks/session-start.mjs\" --harness=codex",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CODEX_PLUGIN_ROOT:-$HOME/.weave-mem/plugins/weave-mem/integrations}/shared/hooks/auto-recall.mjs\" --harness=codex",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CODEX_PLUGIN_ROOT:-$HOME/.weave-mem/plugins/weave-mem/integrations}/shared/hooks/auto-capture.mjs\" --harness=codex",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CODEX_PLUGIN_ROOT:-$HOME/.weave-mem/plugins/weave-mem/integrations}/shared/hooks/auto-capture.mjs\" --harness=codex",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CODEX_PLUGIN_ROOT:-$HOME/.weave-mem/plugins/weave-mem/integrations}/shared/hooks/auto-capture.mjs\" --harness=codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

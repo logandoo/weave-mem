@@ -123,45 +123,84 @@ _epi_indexes: dict[str, BM25Index] = {}
 _sub_indexes: dict[str, BM25Index] = {}
 
 
-async def get_name_index(db, user_id: str) -> BM25Index:
-    if user_id not in _name_indexes:
+def _index_key(user_id: str, agent_id: str | None = None) -> str:
+    """Wave 1：BM25 索引按 (user, agent 作用域) 分桶（NULL 作用域=共享索引）。"""
+    return f"{user_id}:{agent_id or ''}"
+
+
+def update_concept_in_indexes(concept_id: str, user_id: str, agent_id: str | None,
+                              name_text: str, desc_full: str) -> None:
+    """概念创建/更新/合并后刷新所有可见该概念的作用域索引（快照一致性）。
+
+    NULL 作用域写（共享概念）→ 全部 `uid:*` 索引；agent 写 → 共享索引 + 自身索引
+    （其他 agent 的索引不含该概念，不刷）。"""
+    suffix = f"{user_id}:"
+    keys = [k for k in set(_name_indexes) | set(_desc_indexes)
+            if k == user_id or str(k).startswith(suffix)]
+    for key in keys:
+        if agent_id and key != user_id and key != suffix and str(key) != f"{suffix}{agent_id}":
+            # agent 写只刷共享索引 + 自身索引；其他 agent 的索引不含该概念
+            continue
+        nidx = _name_indexes.get(key)
+        if nidx is not None and name_text:
+            nidx.update_doc(concept_id, name_text)
+        didx = _desc_indexes.get(key)
+        if didx is not None and desc_full:
+            didx.update_doc(concept_id, desc_full)
+
+
+def clear_indexes_for_user(user_id: str) -> None:
+    """GDPR 擦除：清空该用户全部作用域索引（旧键 `uid` 与新键 `uid:agent` 兼容）。"""
+    for idx_map in (_name_indexes, _desc_indexes, _epi_indexes, _sub_indexes):
+        for key in [k for k in list(idx_map) if k == user_id or str(k).startswith(f"{user_id}:")]:
+            idx_map.pop(key, None)
+
+
+async def get_name_index(db, user_id: str, agent_id: str | None = None) -> BM25Index:
+    key = _index_key(user_id, agent_id)
+    if key not in _name_indexes:
         idx = BM25Index()
-        _name_indexes[user_id] = idx
-        await _build_concept_name_index_from_db(db, user_id, idx)
-    return _name_indexes[user_id]
+        _name_indexes[key] = idx
+        await _build_concept_name_index_from_db(db, user_id, idx, agent_id)
+    return _name_indexes[key]
 
 
-async def get_desc_index(db, user_id: str) -> BM25Index:
-    if user_id not in _desc_indexes:
+async def get_desc_index(db, user_id: str, agent_id: str | None = None) -> BM25Index:
+    key = _index_key(user_id, agent_id)
+    if key not in _desc_indexes:
         idx = BM25Index()
-        _desc_indexes[user_id] = idx
-        await _build_concept_desc_index_from_db(db, user_id, idx)
-    return _desc_indexes[user_id]
+        _desc_indexes[key] = idx
+        await _build_concept_desc_index_from_db(db, user_id, idx, agent_id)
+    return _desc_indexes[key]
 
 
-async def get_epi_index(db, user_id: str) -> BM25Index:
-    if user_id not in _epi_indexes:
+async def get_epi_index(db, user_id: str, agent_id: str | None = None) -> BM25Index:
+    key = _index_key(user_id, agent_id)
+    if key not in _epi_indexes:
         idx = BM25Index()
-        _epi_indexes[user_id] = idx
-        await _build_episode_index_from_db(db, user_id, idx)
-    return _epi_indexes[user_id]
+        _epi_indexes[key] = idx
+        await _build_episode_index_from_db(db, user_id, idx, agent_id)
+    return _epi_indexes[key]
 
 
-async def get_sub_index(db, user_id: str) -> BM25Index:
-    if user_id not in _sub_indexes:
+async def get_sub_index(db, user_id: str, agent_id: str | None = None) -> BM25Index:
+    key = _index_key(user_id, agent_id)
+    if key not in _sub_indexes:
         idx = BM25Index()
-        _sub_indexes[user_id] = idx
-        await _build_subconscious_index_from_db(db, user_id, idx)
-    return _sub_indexes[user_id]
+        _sub_indexes[key] = idx
+        await _build_subconscious_index_from_db(db, user_id, idx, agent_id)
+    return _sub_indexes[key]
 
 
-async def _build_concept_name_index_from_db(db, user_id: str, idx: BM25Index) -> None:
+async def _build_concept_name_index_from_db(db, user_id: str, idx: BM25Index,
+                                            agent_id: str | None = None) -> None:
     from sqlalchemy import text
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     # 含已失效 + cold_forgotten 概念：as-of 历史查询（§5.2，不限制 status）需检索；
     # 常规查询由 retrieval 层 status/valid_to 过滤
     result = await db.execute(
-        text("SELECT id, canonical_name, aliases FROM memory_concepts WHERE user_id = :uid"),
-        {"uid": user_id},
+        text(f"SELECT id, canonical_name, aliases FROM memory_concepts WHERE user_id = :uid {agent_scope_sql(agent_id)}"),
+        {"uid": user_id, **agent_scope_params(agent_id)},
     )
     for row in result.fetchall():
         cid, name, aliases_raw = row[0], row[1], row[2]
@@ -176,12 +215,14 @@ async def _build_concept_name_index_from_db(db, user_id: str, idx: BM25Index) ->
         idx.add_doc(cid, " ".join(text_parts))
 
 
-async def _build_concept_desc_index_from_db(db, user_id: str, idx: BM25Index) -> None:
+async def _build_concept_desc_index_from_db(db, user_id: str, idx: BM25Index,
+                                            agent_id: str | None = None) -> None:
     from sqlalchemy import text
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     # 同 name 索引：含已失效 + cold_forgotten 供 as-of 查询；常规过滤在 retrieval 层
     result = await db.execute(
-        text("SELECT id, description_full FROM memory_concepts WHERE user_id = :uid"),
-        {"uid": user_id},
+        text(f"SELECT id, description_full FROM memory_concepts WHERE user_id = :uid {agent_scope_sql(agent_id)}"),
+        {"uid": user_id, **agent_scope_params(agent_id)},
     )
     for row in result.fetchall():
         cid, desc = row[0], row[1]
@@ -189,12 +230,14 @@ async def _build_concept_desc_index_from_db(db, user_id: str, idx: BM25Index) ->
             idx.add_doc(cid, desc)
 
 
-async def _build_episode_index_from_db(db, user_id: str, idx: BM25Index) -> None:
+async def _build_episode_index_from_db(db, user_id: str, idx: BM25Index,
+                                       agent_id: str | None = None) -> None:
     from sqlalchemy import text
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     # 含已失效 episode：as-of 历史查询（§5.2）需检索；常规过滤在 retrieval 层
     result = await db.execute(
-        text("SELECT id, narrative FROM memory_episodes WHERE user_id = :uid"),
-        {"uid": user_id},
+        text(f"SELECT id, narrative FROM memory_episodes WHERE user_id = :uid {agent_scope_sql(agent_id)}"),
+        {"uid": user_id, **agent_scope_params(agent_id)},
     )
     for row in result.fetchall():
         eid, narrative = row[0], row[1]
@@ -202,11 +245,13 @@ async def _build_episode_index_from_db(db, user_id: str, idx: BM25Index) -> None
             idx.add_doc(eid, narrative)
 
 
-async def _build_subconscious_index_from_db(db, user_id: str, idx: BM25Index) -> None:
+async def _build_subconscious_index_from_db(db, user_id: str, idx: BM25Index,
+                                            agent_id: str | None = None) -> None:
     from sqlalchemy import text
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     result = await db.execute(
-        text("SELECT id, raw_text FROM subconscious_log WHERE user_id = :uid AND embedding IS NOT NULL AND created_at >= :since"),
-        {"uid": user_id, "since": datetime.utcnow() - timedelta(days=30)},
+        text(f"SELECT id, raw_text FROM subconscious_log WHERE user_id = :uid AND embedding IS NOT NULL AND created_at >= :since {agent_scope_sql(agent_id)}"),
+        {"uid": user_id, "since": datetime.utcnow() - timedelta(days=30), **agent_scope_params(agent_id)},
     )
     for row in result.fetchall():
         sid, raw = row[0], row[1]

@@ -1,5 +1,7 @@
 import json
+import contextvars
 import logging
+from app.services.memory_scope import agent_scope_sql, agent_scope_params
 import uuid
 from datetime import datetime, timedelta
 
@@ -11,6 +13,26 @@ from app.services.memory_embedding_service import embed_text, _emb_to_pgvector
 
 config = get_config()
 logger = logging.getLogger(__name__)
+
+# Wave 1：consolidation 运行作用域（按 (user, agent) 逐次运行；UAS 行写定位取精确匹配）。
+_CONS_AGENT: contextvars.ContextVar = contextvars.ContextVar('consolidation_agent_scope', default=None)
+
+
+def _cs(column: str = 'agent_id') -> str:
+    return agent_scope_sql(_CONS_AGENT.get(), column)
+
+
+def _ce(column: str = 'agent_id') -> str:
+    return f'AND {column} = :agent_scope' if _CONS_AGENT.get() else f'AND {column} IS NULL'
+
+
+def _xe(column: str = 'agent_id') -> str:
+    """精确写作用域（同 _ce，显式列名版；写/改/删必须精确到单一作用域）。"""
+    return f'AND {column} = :agent_scope' if _CONS_AGENT.get() else f'AND {column} IS NULL'
+
+
+def _cp() -> dict:
+    return agent_scope_params(_CONS_AGENT.get())
 
 
 def _sanitize_dream_date(candidate, today: str) -> str:
@@ -31,7 +53,8 @@ def _sanitize_dream_date(candidate, today: str) -> str:
     return today
 
 
-async def run_consolidation(db: AsyncSession, user_id: str) -> dict:
+async def run_consolidation(db: AsyncSession, user_id: str, agent_id: str | None = None) -> dict:
+    _CONS_AGENT.set(agent_id)
     state = await _get_agent_state(db, user_id)
     if not state:
         return {"status": "no_state"}
@@ -69,11 +92,11 @@ async def run_consolidation(db: AsyncSession, user_id: str) -> dict:
             had_failure = True
     if not had_failure:
         # 任一步骤失败即不在部分回滚状态上跑主动 Dreaming（§9.3 隔离原则）
-        await _try_active_dreaming(db, user_id)
+        await _try_active_dreaming(db, user_id, agent_id=_CONS_AGENT.get())
 
     await db.execute(
-        text("UPDATE user_agent_states SET last_consolidation_at = CURRENT_TIMESTAMP WHERE user_id = :uid"),
-        {"uid": user_id},
+        text(f"UPDATE user_agent_states SET last_consolidation_at = CURRENT_TIMESTAMP WHERE user_id = :uid {_ce()}"),
+        {"uid": user_id, **_cp()},
     )
     await db.commit()
     return result
@@ -81,8 +104,8 @@ async def run_consolidation(db: AsyncSession, user_id: str) -> dict:
 
 async def _get_agent_state(db: AsyncSession, user_id: str) -> dict | None:
     result = await db.execute(
-        text("SELECT last_consolidation_at, total_concept_count FROM user_agent_states WHERE user_id = :uid"),
-        {"uid": user_id},
+        text(f"SELECT last_consolidation_at, total_concept_count FROM user_agent_states WHERE user_id = :uid {_cs()} ORDER BY (agent_id IS NULL) ASC, updated_at DESC LIMIT 1"),
+        {"uid": user_id, **_cp()},
     )
     row = result.fetchone()
     return {"last_consolidation_at": row[0], "total_concept_count": row[1]} if row else None
@@ -99,9 +122,9 @@ async def _should_consolidate(db: AsyncSession, user_id: str, state: dict) -> bo
     # “新增/更新”按创建或新证据（last_recurrence_at）计——召回 boost 会 bump updated_at，
     # 用 updated_at 会被召回路径污染导致恒触发（A4.9 审查 #8）
     result = await db.execute(
-        text("""SELECT COUNT(*) FROM memory_concepts
-                WHERE user_id = :uid AND (created_at > :since OR last_recurrence_at > :since)"""),
-        {"uid": user_id, "since": last},
+        text(f"""SELECT COUNT(*) FROM memory_concepts
+                WHERE user_id = :uid AND (created_at > :since OR last_recurrence_at > :since) {_xe()}"""),
+        {"uid": user_id, "since": last, **_cp()},
     )
     changed = result.scalar() or 0
     if changed >= threshold:
@@ -204,7 +227,7 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
 
     # 概念对（ANN 预筛，附录 B；dist < dedup_thresh 即 sim > 0.92）
     pairs_r = await db.execute(
-        text("""
+        text(f"""
             SELECT a.id AS a_id, a.canonical_name AS a_name, a.description_short AS a_short,
                    a.source_trust AS a_trust, a.weight AS a_weight,
                    b.id AS b_id, b.canonical_name AS b_name, b.description_short AS b_short,
@@ -215,6 +238,7 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
                 SELECT id, canonical_name, description_short, source_trust, weight, embedding
                 FROM memory_concepts
                 WHERE user_id = a.user_id
+                  AND agent_id IS NOT DISTINCT FROM a.agent_id
                   AND status IN ('active','silent')
                   AND valid_to IS NULL
                   AND id != a.id
@@ -222,14 +246,14 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
                 ORDER BY embedding <=> a.embedding
                 LIMIT 5
             ) b
-            WHERE a.user_id = :uid
+            WHERE a.user_id = :uid {_xe('a.agent_id')}
               AND a.status IN ('active','silent')
               AND a.valid_to IS NULL
               AND a.embedding IS NOT NULL
               AND (a.embedding <=> b.embedding) < :thresh
               AND a.id < b.id
         """),
-        {"uid": user_id, "thresh": dedup_thresh},
+        {"uid": user_id, "thresh": dedup_thresh, **_cp()},
     )
     concept_pairs = list(pairs_r.fetchall())
     # D3（门默认关）：灰区路由 fast/llm/skip + MST 排序
@@ -262,7 +286,7 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
 
     # episodic 对（同机制，§5.5 Step 1.5）
     epi_pairs_r = await db.execute(
-        text("""
+        text(f"""
             SELECT a.id AS a_id, a.narrative AS a_narr, a.valid_from AS a_vf,
                    b.id AS b_id, b.narrative AS b_narr, b.valid_from AS b_vf,
                    (a.embedding <=> b.embedding) AS dist
@@ -271,19 +295,20 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
                 SELECT id, narrative, valid_from, embedding
                 FROM memory_episodes
                 WHERE user_id = a.user_id
+                  AND agent_id IS NOT DISTINCT FROM a.agent_id
                   AND valid_to IS NULL
                   AND id != a.id
                   AND embedding IS NOT NULL
                 ORDER BY embedding <=> a.embedding
                 LIMIT 5
             ) b
-            WHERE a.user_id = :uid
+            WHERE a.user_id = :uid {_xe('a.agent_id')}
               AND a.valid_to IS NULL
               AND a.embedding IS NOT NULL
               AND (a.embedding <=> b.embedding) < :thresh
               AND a.id < b.id
         """),
-        {"uid": user_id, "thresh": dedup_thresh},
+        {"uid": user_id, "thresh": dedup_thresh, **_cp()},
     )
     epi_pairs = list(epi_pairs_r.fetchall())
     # D3：episodic 快速合并需 LLM 叙事融合（fast 无叙事源）——保守仅 MST 排序
@@ -424,14 +449,14 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
 
 async def _rebalance_clusters(db: AsyncSession, user_id: str, result: dict) -> None:
     await db.execute(
-        text("DELETE FROM memory_clusters WHERE user_id = :uid AND member_count = 0"),
-        {"uid": user_id},
+        text(f"DELETE FROM memory_clusters WHERE user_id = :uid AND member_count = 0 {_xe()}"),
+        {"uid": user_id, **_cp()},
     )
 
     # 待复核概念（needs_review，§5.5 Step 2）：无来源证据则置 valid_to 失效，有证据则清除标记
     review_r = await db.execute(
-        text("SELECT id, source_raw_ids, source_unit_ids FROM memory_concepts WHERE user_id = :uid AND needs_review = TRUE AND valid_to IS NULL"),
-        {"uid": user_id},
+        text(f"SELECT id, source_raw_ids, source_unit_ids FROM memory_concepts WHERE user_id = :uid AND needs_review = TRUE AND valid_to IS NULL {_xe()}"),
+        {"uid": user_id, **_cp()},
     )
     from app.services.memory_concept_service import _parse_json_array
     for row in review_r.fetchall():
@@ -463,8 +488,8 @@ async def _rebalance_clusters(db: AsyncSession, user_id: str, result: dict) -> N
             )
 
     clusters = await db.execute(
-        text("SELECT id, name, member_count FROM memory_clusters WHERE user_id = :uid ORDER BY member_count DESC"),
-        {"uid": user_id},
+        text(f"SELECT id, name, member_count FROM memory_clusters WHERE user_id = :uid {_xe()} ORDER BY member_count DESC"),
+        {"uid": user_id, **_cp()},
     )
     for row in clusters.fetchall():
         cid, count = row[0], row[2]
@@ -488,8 +513,8 @@ async def _find_nearest_cluster(db: AsyncSession, user_id: str, cluster_id: str)
     if IS_SQLITE:
         return None
     r = await db.execute(
-        text("SELECT id FROM memory_clusters WHERE user_id = :uid AND id != :cid ORDER BY embedding <=> (SELECT embedding FROM memory_clusters WHERE id = :cid) LIMIT 1"),
-        {"uid": user_id, "cid": cluster_id},
+        text(f"SELECT id FROM memory_clusters WHERE user_id = :uid AND id != :cid {_xe()} ORDER BY embedding <=> (SELECT embedding FROM memory_clusters WHERE id = :cid) LIMIT 1"),
+        {"uid": user_id, "cid": cluster_id, **_cp()},
     )
     row = r.fetchone()
     return row[0] if row else None
@@ -498,25 +523,25 @@ async def _find_nearest_cluster(db: AsyncSession, user_id: str, cluster_id: str)
 async def _update_relations(db: AsyncSession, user_id: str, result: dict) -> None:
     """§5.5 Step 3：今日新增概念与同集合已有概念批量 LLM 提取关系；清理失效关系。"""
     await db.execute(
-        text("DELETE FROM concept_relations WHERE user_id = :uid AND (source_id IN (SELECT id FROM memory_concepts WHERE user_id = :uid AND status = 'cold_forgotten') OR target_id IN (SELECT id FROM memory_concepts WHERE user_id = :uid AND status = 'cold_forgotten'))"),
-        {"uid": user_id},
+        text(f"DELETE FROM concept_relations WHERE user_id = :uid {_xe()} AND (source_id IN (SELECT id FROM memory_concepts WHERE user_id = :uid {_xe()} AND status = 'cold_forgotten') OR target_id IN (SELECT id FROM memory_concepts WHERE user_id = :uid {_xe()} AND status = 'cold_forgotten'))"),
+        {"uid": user_id, **_cp()},
     )
 
     since = datetime.utcnow() - timedelta(days=1)
     new_r = await db.execute(
-        text("""SELECT id, canonical_name, description_short FROM memory_concepts
-                WHERE user_id = :uid AND created_at >= :since AND valid_to IS NULL LIMIT 30"""),
-        {"uid": user_id, "since": since},
+        text(f"""SELECT id, canonical_name, description_short FROM memory_concepts
+                WHERE user_id = :uid AND created_at >= :since AND valid_to IS NULL {_xe()} LIMIT 30"""),
+        {"uid": user_id, "since": since, **_cp()},
     )
     new_concepts = [{"id": r[0], "name": r[1], "short": r[2]} for r in new_r.fetchall()]
     if not new_concepts:
         return
 
     existing_r = await db.execute(
-        text("""SELECT id, canonical_name, description_short FROM memory_concepts
-                WHERE user_id = :uid AND valid_to IS NULL AND status IN ('active','silent')
+        text(f"""SELECT id, canonical_name, description_short FROM memory_concepts
+                WHERE user_id = :uid AND valid_to IS NULL AND status IN ('active','silent') {_xe()}
                 ORDER BY weight DESC LIMIT 20"""),
-        {"uid": user_id},
+        {"uid": user_id, **_cp()},
     )
     existing = [{"id": r[0], "name": r[1], "short": r[2]} for r in existing_r.fetchall()]
     if not existing:
@@ -568,7 +593,7 @@ async def _update_relations(db: AsyncSession, user_id: str, result: dict) -> Non
         if dup.fetchone():
             continue
         try:
-            await create_relation(db, user_id, sid, tid, rtype, rel.get("description", "")[:500])
+            await create_relation(db, user_id, sid, tid, rtype, rel.get("description", "")[:500], agent_id=_CONS_AGENT.get())
             result["relations_created"] += 1
             if rtype == "contradicts":
                 # contradicts 关系同步触发矛盾降权（§5.3.1a）
@@ -581,20 +606,20 @@ async def _update_relations(db: AsyncSession, user_id: str, result: dict) -> Non
 
 async def _run_weight_decay(db: AsyncSession, user_id: str, result: dict) -> None:
     from app.services.memory_weight_service import run_weight_decay
-    changes = await run_weight_decay(db, user_id)
+    changes = await run_weight_decay(db, user_id, agent_id=_CONS_AGENT.get())
     result["cold_forgotten"] = changes.get("cold_forgotten", 0)
 
 
 async def _update_cluster_weights(db: AsyncSession, user_id: str, result: dict | None = None) -> None:
     """§5.5 Step 4：cluster weight = avg(成员 weight)。"""
     await db.execute(
-        text("""UPDATE memory_clusters mc SET weight = COALESCE((
+        text(f"""UPDATE memory_clusters mc SET weight = COALESCE((
                     SELECT AVG(c.weight) FROM memory_concepts c
                     JOIN concept_cluster_members ccm ON c.id = ccm.concept_id
                     WHERE ccm.cluster_id = mc.id AND c.valid_to IS NULL
                 ), mc.weight), updated_at = CURRENT_TIMESTAMP
-                WHERE mc.user_id = :uid"""),
-        {"uid": user_id},
+                WHERE mc.user_id = :uid {_xe('mc.agent_id')}"""),
+        {"uid": user_id, **_cp()},
     )
 
 
@@ -606,14 +631,14 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
     day_ago = datetime.utcnow() - timedelta(days=1)
 
     new_r = await db.execute(
-        text("SELECT canonical_name FROM memory_concepts WHERE user_id = :uid AND created_at >= :since AND valid_to IS NULL LIMIT 30"),
-        {"uid": user_id, "since": day_ago},
+        text(f"SELECT canonical_name FROM memory_concepts WHERE user_id = :uid AND created_at >= :since AND valid_to IS NULL {_cs()} LIMIT 30"),
+        {"uid": user_id, "since": day_ago, **_cp()},
     )
     new_concepts = [r[0] for r in new_r.fetchall()]
 
     clar_r = await db.execute(
-        text("SELECT original_text, correction_type FROM memory_clarifications WHERE user_id = :uid AND created_at >= :since LIMIT 10"),
-        {"uid": user_id, "since": day_ago},
+        text(f"SELECT original_text, correction_type FROM memory_clarifications WHERE user_id = :uid AND created_at >= :since {_cs()} LIMIT 10"),
+        {"uid": user_id, "since": day_ago, **_cp()},
     )
     clarifications = [{"text": r[0][:100], "type": r[1]} for r in clar_r.fetchall()]
 
@@ -638,17 +663,17 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
     recent_filter = f"({base_filter} AND (last_recalled_at >= :since OR created_at >= :since))"
     top_r = await db.execute(
         text(f"SELECT canonical_name, ROUND(CAST({eff_expr} AS numeric), 2) "
-             f"FROM memory_concepts WHERE user_id = :uid AND {recent_filter} "
+             f"FROM memory_concepts WHERE user_id = :uid AND {recent_filter} {_cs()} "
              "ORDER BY " + eff_expr + " DESC, last_recalled_at DESC NULLS LAST LIMIT 10"),
-        {"uid": user_id, "since": window_since},
+        {"uid": user_id, "since": window_since, **_cp()},
     )
     top_concepts = [{"name": r[0], "weight": float(r[1] or 0)} for r in top_r.fetchall()]
 
     bottom_r = await db.execute(
         text(f"SELECT canonical_name, ROUND(CAST({eff_expr} AS numeric), 2) "
-             f"FROM memory_concepts WHERE user_id = :uid AND {recent_filter} "
+             f"FROM memory_concepts WHERE user_id = :uid AND {recent_filter} {_cs()} "
              "ORDER BY " + eff_expr + " ASC, last_recalled_at DESC NULLS LAST LIMIT 10"),
-        {"uid": user_id, "since": window_since},
+        {"uid": user_id, "since": window_since, **_cp()},
     )
     bottom_concepts = [{"name": r[0], "weight": float(r[1] or 0)} for r in bottom_r.fetchall()]
 
@@ -656,22 +681,22 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
     # NOT(… OR …) 的三值逻辑会把"从未召回的旧导入"从两组名单同时丢掉
     forgotten_r = await db.execute(
         text(f"SELECT canonical_name, ROUND(CAST({eff_expr} AS numeric), 2) "
-             f"FROM memory_concepts WHERE user_id = :uid AND {base_filter} "
+             f"FROM memory_concepts WHERE user_id = :uid AND {base_filter} {_cs()} "
              "AND COALESCE(last_recalled_at, created_at) < :since "
              "ORDER BY " + eff_expr + " ASC LIMIT 10"),
-        {"uid": user_id, "since": window_since},
+        {"uid": user_id, "since": window_since, **_cp()},
     )
     forgotten_concepts = [{"name": r[0], "weight": float(r[1] or 0)} for r in forgotten_r.fetchall()]
 
     cluster_r = await db.execute(
-        text("SELECT name, member_count FROM memory_clusters WHERE user_id = :uid ORDER BY member_count DESC LIMIT 10"),
-        {"uid": user_id},
+        text(f"SELECT name, member_count FROM memory_clusters WHERE user_id = :uid {_cs()} ORDER BY member_count DESC LIMIT 10"),
+        {"uid": user_id, **_cp()},
     )
     clusters = [{"name": r[0], "members": r[1]} for r in cluster_r.fetchall()]
 
     cc_r = await db.execute(
-        text("SELECT COUNT(*) FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND valid_to IS NULL"),
-        {"uid": user_id},
+        text(f"SELECT COUNT(*) FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND valid_to IS NULL {_cs()}"),
+        {"uid": user_id, **_cp()},
     )
     concept_count = cc_r.scalar() or 0
     cluster_count = len(clusters)
@@ -734,8 +759,8 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
         logger.warning("dream LLM failed, using fallback", exc_info=True)
 
     state_r = await db.execute(
-        text("SELECT id FROM user_agent_states WHERE user_id = :uid"),
-        {"uid": user_id},
+        text(f"SELECT id FROM user_agent_states WHERE user_id = :uid {_xe()} ORDER BY (agent_id IS NULL) ASC, updated_at DESC LIMIT 1"),
+        {"uid": user_id, **_cp()},
     )
     state_row = state_r.fetchone()
     if not state_row:
@@ -764,7 +789,7 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
     result["dream_generated"] = True
 
 
-async def _try_active_dreaming(db: AsyncSession, user_id: str) -> None:
+async def _try_active_dreaming(db: AsyncSession, user_id: str, agent_id: str | None = None) -> None:
     if not config.memory.get("dreaming_enabled"):
         return
     from app.services.memory_cost_governance_service import is_step_enabled
@@ -772,6 +797,6 @@ async def _try_active_dreaming(db: AsyncSession, user_id: str) -> None:
         return
     from app.services.memory_dreaming_service import run_active_dreaming
     try:
-        await run_active_dreaming(db, user_id)
+        await run_active_dreaming(db, user_id, agent_id=agent_id)
     except Exception:
         logger.exception("Active dreaming failed for user=%s", user_id)

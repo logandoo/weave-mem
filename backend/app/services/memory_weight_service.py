@@ -201,7 +201,12 @@ def _as_dt(v):
         return None
 
 
-async def run_weight_decay(db: AsyncSession, user_id: str) -> dict:
+async def run_weight_decay(db: AsyncSession, user_id: str,
+                           agent_id: str | None = None) -> dict:
+    from app.services.memory_scope import agent_scope_params
+    # 精确作用域（非读作用域）：consolidation 按 (user,agent) 逐作用域运行，
+    # 读片段会让共享行在每个 agent 运行中重复衰减/hot_forget（A4.9 r2 #2）
+    _exact_w = "agent_id = :agent_scope" if agent_id else "agent_id IS NULL"
     attr = config.memory_fatigue
     hot_threshold = float(config.memory_concept.get("hot_forget_threshold", 0.15))
     avg_reset = config.memory_concept.get("avg_weight_reset", True)
@@ -211,8 +216,8 @@ async def run_weight_decay(db: AsyncSession, user_id: str) -> dict:
     floor_w = float(config.memory_concept.get("weight_decay_floor", 0.05))
 
     result = await db.execute(
-        text("SELECT id, weight, stability, last_recalled_at, memory_type, hot_forget_count, source_trust, status, created_at, importance, weight_decayed_at FROM memory_concepts WHERE user_id = :uid AND status IN ('active','silent') AND valid_to IS NULL"),
-        {"uid": user_id},
+        text(f"SELECT id, weight, stability, last_recalled_at, memory_type, hot_forget_count, source_trust, status, created_at, importance, weight_decayed_at FROM memory_concepts WHERE user_id = :uid AND status IN ('active','silent') AND valid_to IS NULL AND {_exact_w}"),
+        {"uid": user_id, **agent_scope_params(agent_id)},
     )
     rows = result.fetchall()
 
@@ -328,17 +333,19 @@ async def run_weight_decay(db: AsyncSession, user_id: str) -> dict:
     return changes
 
 
-async def try_cold_resurrect(db: AsyncSession, user_message: str, user_id: str) -> list[str]:
+async def try_cold_resurrect(db: AsyncSession, user_message: str, user_id: str,
+                             agent_id: str | None = None) -> list[str]:
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     msg = (user_message or "").lower()
     if not msg:
         return []
     # 候选扫描有界（默认 500，config [memory.concept] cold_resurrect_scan_limit 可调）
     scan_limit = int(config.memory_concept.get("cold_resurrect_scan_limit", 500))
     result = await db.execute(
-        text("SELECT id, canonical_name, aliases, status FROM memory_concepts "
-             "WHERE user_id = :uid AND status IN ('cold_forgotten','silent') "
-             "ORDER BY updated_at DESC LIMIT :lim"),
-        {"uid": user_id, "lim": scan_limit},
+        text(f"SELECT id, canonical_name, aliases, status FROM memory_concepts "
+             f"WHERE user_id = :uid AND status IN ('cold_forgotten','silent') {agent_scope_sql(agent_id)} "
+             f"ORDER BY updated_at DESC LIMIT :lim"),
+        {"uid": user_id, "lim": scan_limit, **agent_scope_params(agent_id)},
     )
     resurrected = []
     for row in result.fetchall():

@@ -100,7 +100,7 @@ async def main() -> None:
         async def fake_embed(text):
             return [0.1] * _dim
 
-        async def fake_neighbors(db, user_id, emb, unit_id, created_at, top_k=5):
+        async def fake_neighbors(db, user_id, emb, unit_id, created_at, top_k=5, agent_id=None):
             result = await db.execute(
                 text("SELECT id, raw_text FROM subconscious_log WHERE user_id = :uid AND id != :uid2 AND promoted = FALSE"),
                 {"uid": user_id, "uid2": unit_id},

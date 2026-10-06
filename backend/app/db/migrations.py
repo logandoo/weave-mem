@@ -33,6 +33,25 @@ STARTUP_MIGRATIONS = [
     # Agent permission settings per user
     ("users_agent_permissions", "ALTER TABLE users ADD COLUMN IF NOT EXISTS agent_permissions TEXT"),
 
+    # ---- Wave 1: agent 身份命名空间（非 memory 表；pgvector 缺失时也应执行）----
+    ("create_agents", """CREATE TABLE IF NOT EXISTS agents (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        agent_key VARCHAR(64) NOT NULL,
+        display_name VARCHAR(120),
+        kind VARCHAR(32) NOT NULL DEFAULT 'manual',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_seen_at TIMESTAMP
+    )"""),
+    ("idx_agents_user", "CREATE INDEX IF NOT EXISTS idx_agents_user ON agents(user_id)"),
+    ("uq_agents_user_key", "CREATE UNIQUE INDEX IF NOT EXISTS uq_agents_user_key ON agents(user_id, agent_key)"),
+    ("pat_agent_id", "ALTER TABLE personal_access_tokens ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)"),
+    ("uas_agent_id", "ALTER TABLE user_agent_states ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)"),
+    # 旧库 user_id 唯一约束必须移除（每 user 多 agent 行）；PG 专用，SQLite 走 skip 规则。
+    ("uas_drop_user_unique", "ALTER TABLE user_agent_states DROP CONSTRAINT IF EXISTS user_agent_states_user_id_key"),
+    # 表达式唯一索引（PG NULL 不去重，不能直接 (user_id, agent_id) 唯一）
+    ("uas_unique_user_agent", "CREATE UNIQUE INDEX IF NOT EXISTS uq_uas_user_agent ON user_agent_states (user_id, COALESCE(agent_id, ''))"),
+
     # Worker instance registry for cross-worker health checks
     ("create_worker_instances", """CREATE TABLE IF NOT EXISTS worker_instances (
         id TEXT PRIMARY KEY,
@@ -247,6 +266,18 @@ STARTUP_MIGRATIONS = [
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )"""),
     ("mrl_idx_user_created", "CREATE INDEX IF NOT EXISTS mrl_idx_user_created ON memory_recall_log(user_id, created_at DESC)"),
+
+    # ---- Wave 1: memory 表 agent 作用域列（依赖 memory 表存在，置于 pgvector 块后）----
+    ("memory_concepts_agent_id", "ALTER TABLE memory_concepts ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)"),
+    ("idx_concepts_user_agent", "CREATE INDEX IF NOT EXISTS idx_concepts_user_agent ON memory_concepts(user_id, agent_id)"),
+    ("memory_episodes_agent_id", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)"),
+    ("memory_clusters_agent_id", "ALTER TABLE memory_clusters ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)"),
+    ("concept_relations_agent_id", "ALTER TABLE concept_relations ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)"),
+    ("memory_clarifications_agent_id", "ALTER TABLE memory_clarifications ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)"),
+    ("subconscious_log_agent_id", "ALTER TABLE subconscious_log ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)"),
+    ("subconscious_log_conversation_id", "ALTER TABLE subconscious_log ADD COLUMN IF NOT EXISTS conversation_id VARCHAR(64)"),
+    ("memory_llm_calls_agent_id", "ALTER TABLE memory_llm_calls ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)"),
+    ("memory_recall_log_agent_id", "ALTER TABLE memory_recall_log ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)"),
 ]
 
 # §9.5 pgvector 缺失降级：启动探测结果（run_startup_migrations 期间更新）。
@@ -377,6 +408,16 @@ async def run_startup_migrations(conn) -> None:
                     {"version": version},
                 )
                 continue
+
+        if _sqlite and "DROP CONSTRAINT" in statement:
+            # SQLite 无 DROP CONSTRAINT 语法：旧 SQLite 库的 unique(user_id) 无法在线
+            # 删除（建库即由 ORM 固化）。老库多 agent 状态行由 ensure_agent_registered
+            # 的 savepoint 重试兜底降级（无状态行≠作用域失效）；新库 schema 无此约束。
+            await conn.execute(
+                text("INSERT INTO migration_versions (version) VALUES (:version)"),
+                {"version": version},
+            )
+            continue
 
         if idx >= mem_start and not PGVECTOR_AVAILABLE:
             if _sqlite:

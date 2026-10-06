@@ -55,10 +55,12 @@ def cleanup_statements(days: int, dialect: str = "postgres") -> list[str]:
     ]
 
 
-def _row_payload(user_id: str, query_text: str, memory_ids, stats: dict) -> dict:
+def _row_payload(user_id: str, query_text: str, memory_ids, stats: dict,
+                 agent_id: str | None = None) -> dict:
     return {
         "id": str(uuid.uuid4()),
         "user_id": user_id,
+        "agent_id": agent_id,
         "query_hash": query_hash_of(query_text),
         "candidate_ids": json.dumps([str(i) for i in (memory_ids or [])][:200], ensure_ascii=False),
         "tier_scores": json.dumps(stats.get("tier_scores") or {}, ensure_ascii=False),
@@ -74,18 +76,19 @@ def _row_payload(user_id: str, query_text: str, memory_ids, stats: dict) -> dict
 async def record_recall_log(
     db: AsyncSession, user_id: str, query_text: str,
     memory_ids: list[str] | None = None, stats: dict | None = None,
+    agent_id: str | None = None,
 ) -> None:
     cfg = get_config().memory or {}
     if not cfg.get("recall_log_enabled", True):
         return
     if not should_sample(float(cfg.get("recall_log_sample_rate", 1.0))):
         return
-    payload = _row_payload(user_id, query_text, memory_ids, stats or {})
+    payload = _row_payload(user_id, query_text, memory_ids, stats or {}, agent_id=agent_id)
     async with db.begin_nested():
         await db.execute(
-            text("INSERT INTO memory_recall_log (id, user_id, query_hash, candidate_ids, tier_scores, "
+            text("INSERT INTO memory_recall_log (id, user_id, agent_id, query_hash, candidate_ids, tier_scores, "
                  "gate_score, budget_chars, injected_chars, truncated, elapsed_ms, cache_hit, created_at) "
-                 "VALUES (:id, :user_id, :query_hash, :candidate_ids, :tier_scores, :gate_score, "
+                 "VALUES (:id, :user_id, :agent_id, :query_hash, :candidate_ids, :tier_scores, :gate_score, "
                  ":budget_chars, :injected_chars, :truncated, :elapsed_ms, :cache_hit, CURRENT_TIMESTAMP)"),
             payload,
         )
@@ -94,12 +97,14 @@ async def record_recall_log(
 async def record_recall_log_bg(
     user_id: str, query_text: str,
     memory_ids: list[str] | None = None, stats: dict | None = None,
+    agent_id: str | None = None,
 ) -> None:
     """fire-and-forget：独立会话，失败静默（绝不拖慢召回主链路）。"""
     try:
         from app.db.database import AsyncSessionLocal
         async with AsyncSessionLocal() as db:
-            await record_recall_log(db, user_id, query_text, memory_ids=memory_ids, stats=stats)
+            await record_recall_log(db, user_id, query_text, memory_ids=memory_ids, stats=stats,
+                                    agent_id=agent_id)
             await db.commit()
     except Exception:
         logger.debug("record_recall_log_bg silent-fail user=%s", user_id)
@@ -108,8 +113,10 @@ async def record_recall_log_bg(
 def spawn_recall_log(
     user_id: str, query_text: str,
     memory_ids: list[str] | None = None, stats: dict | None = None,
+    agent_id: str | None = None,
 ):
-    task = asyncio.create_task(record_recall_log_bg(user_id, query_text, memory_ids, stats))
+    task = asyncio.create_task(record_recall_log_bg(user_id, query_text, memory_ids, stats,
+                                                    agent_id=agent_id))
     _WRITE_TASKS.add(task)
     task.add_done_callback(_WRITE_TASKS.discard)
     return task

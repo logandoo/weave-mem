@@ -39,12 +39,14 @@ def detect_signal(user_message: str) -> bool:
 async def process_clarification(
     db: AsyncSession, user_id: str, user_message: str,
     conversation_id: str | None = None, message_id: str | None = None,
+    agent_id: str | None = None,
 ) -> dict | None:
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     from app.services.memory_llm_factory import _memory_llm
 
     result = await db.execute(
-        text("SELECT id, canonical_name, description_short, aliases FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 AND valid_to IS NULL ORDER BY weight DESC LIMIT 5"),
-        {"uid": user_id},
+        text(f"SELECT id, canonical_name, description_short, aliases FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 AND valid_to IS NULL {agent_scope_sql(agent_id)} ORDER BY weight DESC LIMIT 5"),
+        {"uid": user_id, **agent_scope_params(agent_id)},
     )
     concepts = [{"id": r[0], "name": r[1], "short": r[2], "aliases": r[3]} for r in result.fetchall()]
 
@@ -96,6 +98,7 @@ async def process_clarification(
     clarification = MemoryClarification(
         id=clar_id,
         user_id=user_id,
+        agent_id=agent_id,
         conversation_id=conversation_id,
         message_id=message_id,
         original_text=user_message,
@@ -109,14 +112,16 @@ async def process_clarification(
     db.add(clarification)
 
     if confidence >= auto_threshold:
-        await _apply_clarification(db, parsed, user_id)
+        await _apply_clarification(db, parsed, user_id, agent_id=agent_id)
         await db.flush()
 
     await db.commit()
     return parsed
 
 
-async def _apply_clarification(db: AsyncSession, parsed: dict, user_id: str) -> None:
+async def _apply_clarification(db: AsyncSession, parsed: dict, user_id: str,
+                               agent_id: str | None = None) -> None:
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     ctype = parsed.get("correction_type", "negate")
     affected_ids = parsed.get("affected_concept_ids", [])
     if not isinstance(affected_ids, list):
@@ -125,15 +130,15 @@ async def _apply_clarification(db: AsyncSession, parsed: dict, user_id: str) -> 
     if ctype == "negate":
         for cid in affected_ids:
             await db.execute(
-                text("UPDATE memory_concepts SET valid_to = CURRENT_TIMESTAMP, weight = 0, updated_at = CURRENT_TIMESTAMP WHERE id = :id AND user_id = :uid"),
-                {"id": cid, "uid": user_id},
+                text(f"UPDATE memory_concepts SET valid_to = CURRENT_TIMESTAMP, weight = 0, updated_at = CURRENT_TIMESTAMP WHERE id = :id AND user_id = :uid {agent_scope_sql(agent_id)}"),
+                {"id": cid, "uid": user_id, **agent_scope_params(agent_id)},
             )
 
     elif ctype == "refine":
         new_desc = parsed.get("new_description") or ""
         for cid in affected_ids:
             concept = await db.get(MemoryConcept, cid)
-            if not concept or concept.user_id != user_id:
+            if not concept or concept.user_id != user_id or (concept.agent_id or None) != (agent_id or None):
                 continue
             old_full = concept.description_full
             concept.metadata_json = json.dumps({
@@ -152,7 +157,7 @@ async def _apply_clarification(db: AsyncSession, parsed: dict, user_id: str) -> 
     elif ctype == "add_constraint":
         for cid in affected_ids:
             concept = await db.get(MemoryConcept, cid)
-            if not concept or concept.user_id != user_id:
+            if not concept or concept.user_id != user_id or (concept.agent_id or None) != (agent_id or None):
                 continue
             if concept.description_full and parsed.get("new_description"):
                 concept.metadata_json = json.dumps({
@@ -164,21 +169,22 @@ async def _apply_clarification(db: AsyncSession, parsed: dict, user_id: str) -> 
     elif ctype == "forget":
         for cid in affected_ids:
             concept = await db.get(MemoryConcept, cid)
-            if not concept or concept.user_id != user_id:
+            if not concept or concept.user_id != user_id or (concept.agent_id or None) != (agent_id or None):
                 continue
             await db.execute(text("DELETE FROM concept_cluster_members WHERE concept_id = :id"), {"id": cid})
             await db.execute(text("DELETE FROM concept_relations WHERE source_id = :id OR target_id = :id"), {"id": cid})
-            await db.execute(text("DELETE FROM memory_concepts WHERE id = :id AND user_id = :uid"), {"id": cid, "uid": user_id})
+            await db.execute(text(f"DELETE FROM memory_concepts WHERE id = :id AND user_id = :uid {agent_scope_sql(agent_id)}"), {"id": cid, "uid": user_id, **agent_scope_params(agent_id)})
 
 
-async def apply_clarification(db: AsyncSession, user_id: str, clarification_id: str) -> bool:
+async def apply_clarification(db: AsyncSession, user_id: str, clarification_id: str,
+                              agent_id: str | None = None) -> bool:
     """手动应用 pending 澄清（B-5：confidence < auto 阈值落库后的确认途径）。
 
     仅 applied=FALSE 的澄清可应用；复用 _apply_clarification 语义
     （negate/refine/add_constraint/forget），forget 类型同样放行。
     """
     clar = await db.get(MemoryClarification, clarification_id)
-    if not clar or clar.user_id != user_id or clar.applied:
+    if not clar or clar.user_id != user_id or (clar.agent_id or None) != (agent_id or None) or clar.applied:
         return False
     if clar.correction_type not in ("negate", "refine", "add_constraint", "forget"):
         return False
@@ -200,14 +206,16 @@ async def apply_clarification(db: AsyncSession, user_id: str, clarification_id: 
         "affected_concept_ids": affected,
         "new_description": clar.new_description or "",
     }
-    await _apply_clarification(db, parsed, user_id)
+    await _apply_clarification(db, parsed, user_id, agent_id=agent_id)
     return True
 
 
-async def get_recent_clarifications(db: AsyncSession, user_id: str, days: int = 3) -> list[dict]:
+async def get_recent_clarifications(db: AsyncSession, user_id: str, days: int = 3,
+                                     agent_id: str | None = None) -> list[dict]:
+    from app.services.memory_scope import agent_scope_sql, agent_scope_params
     result = await db.execute(
-        text("SELECT original_text, correction_type, affected_concept_ids, new_description FROM memory_clarifications WHERE user_id = :uid AND applied = TRUE AND applied_at >= :since ORDER BY applied_at DESC LIMIT 10"),
-        {"uid": user_id, "since": datetime.utcnow() - timedelta(days=days)},
+        text(f"SELECT original_text, correction_type, affected_concept_ids, new_description FROM memory_clarifications WHERE user_id = :uid AND applied = TRUE AND applied_at >= :since {agent_scope_sql(agent_id)} ORDER BY applied_at DESC LIMIT 10"),
+        {"uid": user_id, "since": datetime.utcnow() - timedelta(days=days), **agent_scope_params(agent_id)},
     )
     return [
         {"original_text": r[0], "correction_type": r[1],
@@ -216,14 +224,15 @@ async def get_recent_clarifications(db: AsyncSession, user_id: str, days: int = 
     ]
 
 
-async def revert_clarification(db: AsyncSession, user_id: str, clarification_id: str) -> bool:
+async def revert_clarification(db: AsyncSession, user_id: str, clarification_id: str,
+                               agent_id: str | None = None) -> bool:
     """§9.6/§10.4：撤销已应用的澄清。
 
     negate → 清 valid_to 恢复有效（weight 回初始值）；refine/add_constraint →
     回滚 metadata_json 中的旧版本并重生成 embedding；forget 物理删除不可撤销。
     """
     clar = await db.get(MemoryClarification, clarification_id)
-    if not clar or clar.user_id != user_id or not clar.applied:
+    if not clar or clar.user_id != user_id or (clar.agent_id or None) != (agent_id or None) or not clar.applied:
         return False
     if clar.correction_type == "forget":
         return False
@@ -235,7 +244,7 @@ async def revert_clarification(db: AsyncSession, user_id: str, clarification_id:
 
     for cid in affected:
         concept = await db.get(MemoryConcept, cid)
-        if not concept or concept.user_id != user_id:
+        if not concept or concept.user_id != user_id or (concept.agent_id or None) != (agent_id or None):
             continue
         if clar.correction_type == "negate":
             concept.valid_to = None

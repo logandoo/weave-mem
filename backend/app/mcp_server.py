@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 
 
 def create_mcp_server(base_url: str, username: str = "", password: str = "", token: str = "",
-                     timeout: float = 60.0) -> MCPServer:
-    """构造 MCP server（工具 = HTTP 薄转发）。"""
+                     timeout: float = 60.0, agent_id: str = "") -> MCPServer:
+    """构造 MCP server（工具 = HTTP 薄转发）。agent_id 非空时全部请求带 X-Agent-Id。"""
     mcp = MCPServer(
         "weave-mem",
         version="1.0.0",
@@ -33,7 +33,7 @@ def create_mcp_server(base_url: str, username: str = "", password: str = "", tok
             "会真实修改记忆；gdpr_erase 为全量擦除，使用前必须确认。"
         ),
     )
-    client = MemoryClient(base_url, username, password, token, timeout=timeout)
+    client = MemoryClient(base_url, username, password, token, timeout=timeout, agent_id=agent_id)
 
     @mcp.tool()
     async def memory_status() -> dict:
@@ -145,14 +145,21 @@ def create_mcp_server(base_url: str, username: str = "", password: str = "", tok
 
 
 def build_mcp_server_from_config() -> MCPServer:
-    """从 config.toml [mcp] 段构造（stdio 入口与 FastAPI 挂载共用）。"""
+    """从 config.toml [mcp] 段构造（stdio 入口与 FastAPI 挂载共用）。
+
+    agent 作用域来源：`WEAVE_MEM_AGENT_ID` 环境变量 > config [mcp] agent_id
+    （每个 harness 起独立 MCP 进程并注入自身 agent_id 即天然隔离）。
+    """
+    import os
     from app.core.config import get_config
     cfg = get_config()
     mcp_cfg = cfg.mcp or {}
+    agent_id = os.environ.get("WEAVE_MEM_AGENT_ID") or str(mcp_cfg.get("agent_id") or "")
     return create_mcp_server(
         base_url=str(mcp_cfg.get("base_url") or "http://127.0.0.1:8202"),
         username=str(mcp_cfg.get("username") or ""),
         password=str(mcp_cfg.get("password") or ""),
         token=str(mcp_cfg.get("token") or ""),
         timeout=float(mcp_cfg.get("timeout", 60.0)),
+        agent_id=agent_id,
     )

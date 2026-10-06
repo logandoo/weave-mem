@@ -29,7 +29,7 @@ async def verify_password(password: str, hashed: str) -> bool:
     )
 
 
-def create_access_token(user_id: str, username: str) -> str:
+def create_access_token(user_id: str, username: str, agent_id: Optional[str] = None) -> str:
     expire = datetime.utcnow() + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
     payload = {
         "sub": user_id,
@@ -38,6 +38,8 @@ def create_access_token(user_id: str, username: str) -> str:
         "iat": datetime.utcnow(),
         "jti": str(uuid.uuid4())
     }
+    if agent_id:
+        payload["agent_id"] = agent_id
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
@@ -61,20 +63,22 @@ def hash_pat(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-async def create_pat(db: AsyncSession, user_id: str, name: str = "") -> tuple[str, str]:
-    """创建 PAT：返回 (id, 明文)。明文仅此一次可见。"""
+async def create_pat(db: AsyncSession, user_id: str, name: str = "",
+                     agent_id: Optional[str] = None) -> tuple[str, str]:
+    """创建 PAT：返回 (id, 明文)。明文仅此一次可见。agent_id 可绑定作用域。"""
     from app.db.database import PersonalAccessToken
     plain = generate_pat()
     pat = PersonalAccessToken(
-        id=str(uuid.uuid4()), user_id=user_id, token_hash=hash_pat(plain), name=name or "default",
+        id=str(uuid.uuid4()), user_id=user_id, token_hash=hash_pat(plain),
+        name=name or "default", agent_id=agent_id,
     )
     db.add(pat)
     await db.flush()
     return pat.id, plain
 
 
-async def validate_pat(db: AsyncSession, token: str) -> Optional[str]:
-    """校验 PAT：有效返回 user_id，否则 None。命中后更新 last_used_at。"""
+async def validate_pat(db: AsyncSession, token: str) -> Optional[tuple[str, Optional[str]]]:
+    """校验 PAT：有效返回 (user_id, agent_id)，否则 None。命中后更新 last_used_at。"""
     from app.db.database import PersonalAccessToken
     if not token.startswith("wm_"):
         return None
@@ -89,4 +93,4 @@ async def validate_pat(db: AsyncSession, token: str) -> Optional[str]:
         return None
     pat.last_used_at = datetime.utcnow()
     await db.flush()
-    return pat.user_id
+    return pat.user_id, pat.agent_id

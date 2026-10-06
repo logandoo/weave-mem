@@ -86,6 +86,7 @@ async def record_answer_adoption(
     user_id: str,
     injected_ids: list[str],
     answer_text: str,
+    agent_id: str | None = None,
 ) -> dict:
     """本轮注入证据被回答引用 → 权重/边权回写。fail-open，返回摘要。"""
     summary: dict = {"adopted": [], "skipped": 0}
@@ -103,9 +104,12 @@ async def record_answer_adoption(
         rows = (await db.execute(
             text(f"""
                 SELECT id, canonical_name, aliases FROM memory_concepts
-                WHERE user_id = :u AND {id_sql} AND valid_to IS NULL
+                WHERE user_id = :u AND {id_sql} AND valid_to IS NULL AND (agent_id IS NULL OR agent_id = :agent_scope)
+            """) if agent_id else text(f"""
+                SELECT id, canonical_name, aliases FROM memory_concepts
+                WHERE user_id = :u AND {id_sql} AND valid_to IS NULL AND agent_id IS NULL
             """),
-            {"u": user_id, **id_params},
+            {"u": user_id, "agent_scope": agent_id, **id_params} if agent_id else {"u": user_id, **id_params},
         )).mappings().all()
         if not rows:
             return summary
@@ -124,9 +128,13 @@ async def record_answer_adoption(
                 text(f"""
                     UPDATE concept_relations SET
                       weight = {bound}
-                    WHERE (source_id = :id OR target_id = :id) AND user_id = :u
+                    WHERE (source_id = :id OR target_id = :id) AND user_id = :u AND (agent_id IS NULL OR agent_id = :agent_scope)
+                """) if agent_id else text(f"""
+                    UPDATE concept_relations SET
+                      weight = {bound}
+                    WHERE (source_id = :id OR target_id = :id) AND user_id = :u AND agent_id IS NULL
                 """),
-                {"id": cid, "u": user_id, "bump": _EDGE_BUMP, "cap": _EDGE_CAP},
+                {"id": cid, "u": user_id, "bump": _EDGE_BUMP, "cap": _EDGE_CAP, "agent_scope": agent_id} if agent_id else {"id": cid, "u": user_id, "bump": _EDGE_BUMP, "cap": _EDGE_CAP},
             )
         summary["adopted"] = adopted
         _USER_ADOPT_TS[user_id] = ts + [_now]
@@ -151,18 +159,20 @@ async def record_answer_adoption_bg(
     user_id: str,
     injected_ids: list[str],
     answer_text: str,
+    agent_id: str | None = None,
 ) -> None:
     """fire-and-forget 包装：独立 DB 会话，失败静默（对齐 recall boost 口径）。"""
     try:
         from app.db.database import AsyncSessionLocal
         async with AsyncSessionLocal() as db:
-            await record_answer_adoption(db, user_id, injected_ids, answer_text)
+            await record_answer_adoption(db, user_id, injected_ids, answer_text, agent_id=agent_id)
             await db.commit()
     except Exception:
         logger.debug("record_answer_adoption_bg failed (fail-open)", exc_info=True)
 
 
-def spawn_answer_adoption(user_id: str, injected_ids: list[str], answer_text: str):
+def spawn_answer_adoption(user_id: str, injected_ids: list[str], answer_text: str,
+                          agent_id: str | None = None):
     """在事件循环上调度采纳回写任务（调用方持有任务集防 GC）。"""
     return asyncio.create_task(
-        record_answer_adoption_bg(user_id, injected_ids, answer_text))
+        record_answer_adoption_bg(user_id, injected_ids, answer_text, agent_id=agent_id))

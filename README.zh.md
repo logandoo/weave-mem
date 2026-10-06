@@ -262,6 +262,40 @@ curl -sS -X DELETE http://127.0.0.1:8202/api/auth/tokens/<id> -H "Authorization:
 
 端点：`POST /api/auth/tokens`（创建）、`GET /api/auth/tokens`（列表）、`DELETE /api/auth/tokens/{id}`（撤销）。
 
+## Agent 作用域（多 agent 记忆命名空间）
+
+多个 agent（Claude Code、Codex、OpenCode、DeepSeek Harness、脚本…）可共用同一账号而互不污染：
+
+- **共享 vs 私有**——`agent_id IS NULL` 行为用户级共享记忆（所有 agent 与旧客户端可见）；非空行仅该 agent 可见。读=共享+自身；写自动盖上调用方 agent。
+- **作用域设置**——请求头 `X-Agent-Id: <key>`（`[A-Za-z0-9._-]{1,64}`，非法→422），或在创建 token 时绑定：`POST /api/auth/tokens {"name":"claude-code","agent_id":"claude-code"}`，或 `POST /api/auth/login {"agent_id":"…"}`。header 优先于 token 绑定。
+- **MCP**——每个 harness 以 `WEAVE_MEM_AGENT_ID=<key>`（或 config.toml 的 `[mcp] agent_id`）启动自己的 MCP 进程。
+- **SDK**——`MemoryClient(base_url, token=..., agent_id="claude-code")`。
+- **归因**——`memory_recall_log` 与 concepts/episodes/clarifications 列表响应携带 `agent_id`；调度器按 `(user, agent)` 作用域分别跑 consolidation/扫描，仅在单一作用域内合并。
+
+```bash
+# 以 agent "claude-code" 写入，读回仅该作用域（+ 共享）
+curl -sS -X POST http://127.0.0.1:8202/api/memory/concepts \
+  -H "Authorization: Bearer $PAT" -H "X-Agent-Id: claude-code" \
+  -H 'Content-Type: application/json' -d '{"canonical_name":"editor","description_short":"prefers Vim"}'
+```
+
+## Agent 集成（Claude Code / Codex / OpenCode / DeepSeek Harness）
+
+`integrations/` 下的生命周期插件在 MCP 之外提供自动召回 + 自动捕获——模型无需调用任何工具。
+每个 harness 运行在独立 agent 作用域（`X-Agent-Id`），记忆互不混杂。
+
+| Harness | 路径 | 机制 |
+|---|---|---|
+| Claude Code | `integrations/claude-code` | hooks：`UserPromptSubmit` 召回，`Stop`/`PreCompact`/`SessionEnd`/`SubagentStop` 捕获，`.mcp.json` 挂工具 |
+| Codex | `integrations/codex` | 同 hook 核心，Codex 输出契约（no-op `{}`、无 `decision:approve`） |
+| OpenCode | `integrations/opencode` | 插件（`chat.message` 召回、`session.idle` 捕获）；V2 `setup()` beta |
+| DeepSeek Harness | `integrations/dsh` | Cordis 插件（`agent/pre-step` 合并召回消息、`session/event` 捕获、durable pending 队列）——已对 dsh 0.1.5-rc 真运行时验证 |
+| 共享核心 | `integrations/shared` | 零依赖 `.mjs`：config/client/recall-block/capture/state + selftest |
+
+安装与配置见各 `integrations/*/README.md`。捕获 = 每轮单条 `POST /api/memory/ingest`
+（recurrence 门控晋升——无需 session/commit 机制）；注入的 `<weave-mem-context>` 块
+在捕获时被剥离；全部 fail-open。
+
 ## OpenAPI 规范
 
 - 运行时：`http://127.0.0.1:8202/docs`（Swagger UI）/ `/openapi.json`
