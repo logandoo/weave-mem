@@ -389,7 +389,6 @@ async def find_neighbors_for_unit(
 async def _probe_main_provider() -> tuple[bool, Optional[int]]:
     cfg = get_config()
     base_url = (cfg.memory.get("embedding_api_base") or "").rstrip("/")
-    api_key = cfg.memory.get("embedding_api_key") or ""
     model = cfg.memory.get("embedding_model", "text-embedding-3-small")
 
     if not base_url:
