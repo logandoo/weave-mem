@@ -71,4 +71,6 @@ fi
 VENV_PY="$(venv_python "$VENV_DIR")" || { echo "无法定位 venv 解释器: $VENV_DIR" >&2; exit 1; }
 "$VENV_PY" -m pip install --upgrade pip
 "$VENV_PY" -m pip install -r "$DIR/backend/requirements.txt"
+# weave-mem-client SDK（发布包）——绝对路径可编辑安装（pip 26 拒 requirements 内裸相对 -e）
+"$VENV_PY" -m pip install -e "$DIR/client"
 echo "依赖安装完成: $VENV_DIR"

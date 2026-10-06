@@ -1,4 +1,4 @@
--e ../client
+# weave-mem-client SDK 由 script/linux/install_venv.sh 以绝对路径 `pip install -e <repo>/client` 装入
 fastapi
 uvicorn[standard]
 sqlalchemy[asyncio]
