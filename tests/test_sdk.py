@@ -94,6 +94,13 @@ async def main() -> None:
             check("SDK 未认证 401 语义", "401" in str(e), f"e={e}")
     check("SDK 包版本可读", bool(__version__), f"v={__version__}")
 
+    # 自带头合并（双审 I1）：headers= 不再 TypeError，且鉴权头不被覆盖
+    async with MemoryClient(BASE, username=uname, password="test123", timeout=30.0) as c2:
+        body = await c2.request("GET", "/api/memory/status", headers={"X-Trace": "sdk"})
+        check("SDK request 自带头合并", body.get("status") == "ok", f"body={body}")
+        root = await c2.root()
+        check("SDK root（第 32 路径）", isinstance(root, dict) and root, f"root={root}")
+
     print(f"\n==== 结果: {passed} passed, {failed} failed ====")
     sys.exit(0 if failed == 0 else 1)
 

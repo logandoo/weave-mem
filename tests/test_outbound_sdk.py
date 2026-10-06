@@ -83,7 +83,7 @@ async def main() -> None:
         vec = await embed_text("hello sdk")
         check("SDK embedding 解析向量", vec == [0.1, 0.2, 0.3, 0.4], f"vec={vec}")
         hit = _StubHandler.seen[-1] if _StubHandler.seen else {}
-        check("SDK 走 /embeddings 端点", str(hit.get("path", "")).endswith("/embeddings"),
+        check("SDK 走 /v1/embeddings 精确端点", hit.get("path") == "/v1/embeddings",
               f"path={hit.get('path')}")
         check("SDK 请求体含 model=stub-model", b"stub-model" in (hit.get("body") or b""),
               f"body={hit.get('body')[:80]}")
@@ -117,6 +117,23 @@ async def main() -> None:
     finally:
         cfg._config["memory"] = saved
         server.shutdown()
+
+    # C1 回归（双审 Critical）：无 embedding 端点时 fail-closed——绝不向
+    # api.openai.com 等任何外部端点外发（旧 httpx 空 base 即拒，SDK 传 None 会外泄）
+    try:
+        cfg._config.setdefault("memory", {})
+        cfg._config["memory"]["embedding_api_base"] = ""
+        cfg._config.setdefault("api", {})
+        saved_main = dict(cfg._config["api"])
+        cfg._config["api"]["base_url"] = ""
+        cfg._config["api"]["api_key"] = ""
+        _StubHandler.seen.clear()
+        vec = await embed_text("机密文本不得外发")
+        check("C1 空 base fail-closed 返回 None", vec is None, f"vec={vec}")
+        check("C1 零请求外发", len(_StubHandler.seen) == 0, f"seen={len(_StubHandler.seen)}")
+        cfg._config["api"] = saved_main
+    finally:
+        pass
 
     print(f"\n==== 结果: {passed} passed, {failed} failed ====")
     sys.exit(0 if failed == 0 else 1)

@@ -50,8 +50,11 @@ class MemoryClient:
     async def request(self, method: str, path: str, *, auth: bool = True, **kwargs) -> Any:
         if auth:
             await self.ensure_auth()
-        headers = {"Authorization": f"Bearer {self.token}"} if auth and self.token else {}
-        resp = await self._client.request(method, f"{self.base_url}{path}", headers=headers, **kwargs)
+        # 自带头与鉴权头合并（双审 I1：裸传 headers= 会与关键字参数相撞）
+        extra = dict(kwargs.pop("headers", None) or {})
+        if auth and self.token:
+            extra.setdefault("Authorization", f"Bearer {self.token}")
+        resp = await self._client.request(method, f"{self.base_url}{path}", headers=extra, **kwargs)
         if resp.status_code >= 400:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
         if not resp.content:
@@ -74,6 +77,8 @@ class MemoryClient:
         return self.token
 
     async def logout(self) -> Any:
+        """登出当前会话。注意：清除本地 token（含构造传入的 PAT——服务端 PAT 仍有效）；
+        若构造给了 username/password，下次调用会自动重登。"""
         out = await self.request("POST", "/api/auth/logout")
         self._authenticated = False
         self.token = ""
@@ -92,7 +97,11 @@ class MemoryClient:
     async def revoke_token(self, token_id: str) -> Any:
         return await self.request("DELETE", f"/api/auth/tokens/{token_id}")
 
-    # ---------- 健康 ----------
+    # ---------- 根 / 健康 ----------
+    async def root(self) -> dict:
+        """GET / — 服务根信息（openapi 第 32 条路径）。"""
+        return await self.request("GET", "/", auth=False)
+
     async def healthz(self) -> dict:
         return await self.request("GET", "/healthz", auth=False)
 

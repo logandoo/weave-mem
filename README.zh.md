@@ -46,7 +46,7 @@ weave-mem/
 ├── docs/
 │   └── openapi.json        # 固化 OpenAPI 规范（32 路径）
 ├── memory/                 # 项目记忆（MEMORY.md 索引 + 主题笔记）
-└── tests/                  # 13 个验收套件（见"测试"）
+└── tests/                  # 14 个验收套件（见"测试"）
 ```
 
 ## 部署前提
@@ -114,6 +114,7 @@ bash script/linux/install_venv.sh
 ```bash
 python3.11 -m venv .venv     # 或 python3.13
 ./.venv/bin/pip install -r backend/requirements.txt
+./.venv/bin/pip install -e ./client   # weave-mem-client SDK（MCP 依赖，必装）
 ```
 
 ### 3. 修改配置（backend/config.toml）
@@ -376,7 +377,7 @@ async with MemoryClient("http://127.0.0.1:8202", username="test", password="1234
 
 ## 测试
 
-9 个验收套件（服务需先启动）：
+14 个验收套件（服务需先启动）：
 
 ```bash
 for t in test_api test_recall test_ingest_clarify test_clarify_apply test_blindspot \

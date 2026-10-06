@@ -109,6 +109,7 @@ Equivalent manual steps:
 ```bash
 python3.11 -m venv .venv     # or python3.13
 ./.venv/bin/pip install -r backend/requirements.txt
+./.venv/bin/pip install -e ./client   # weave-mem-client SDK（MCP 依赖，必装）
 ```
 
 ### 3. Configuration
@@ -376,13 +377,13 @@ HTTP because no standard SDK exists for that contract.
 
 ## Testing
 
-13 acceptance suites (the service must be running first; `test_sqlite_mode` requires
+14 acceptance suites (the service must be running first; `test_sqlite_mode` requires
 `[database] type="sqlite"` and is run separately):
 
 ```bash
 for t in test_api test_recall test_ingest_clarify test_clarify_apply test_blindspot \
          test_full_chain test_pat test_mcp test_sync_p0 test_adoption \
-         test_p2_gates test_recall_log; do
+         test_p2_gates test_recall_log test_sdk test_outbound_sdk; do
   ./.venv/bin/python tests/$t.py > tests/$t.log 2>&1 && echo "$t PASS" || echo "$t FAIL"
 done
 ```
@@ -401,6 +402,8 @@ done
 | test_sync_p0.py | 19 items: no-key guards ×3 sites / resurrect decay-anchor / atomic weight + answer_cited / billing_class split / cluster embedding write path + backfill dry-run |
 | test_adoption.py | 17 items: POST /api/memory/adoption contract + write-back chain + edge cap + cross-modal consistency pure-fn 8 states |
 | test_p2_gates.py | 33 items: strategy routing / D1 edges+whitelist+P/L / D2 MMR+contradicts / D3 gray-zone+MST / E1+A4c / W8 link expansion |
+| test_sdk.py | 20 items: weave-mem-client SDK end-to-end (32 paths incl. root) + auth/headers semantics |
+| test_outbound_sdk.py | 11 items: outbound embedding via official SDK (stub server) incl. no-key sentinel + C1 empty-base fail-closed |
 | test_recall_log.py | 16 items: ledger metadata-only + keyset pagination + dual-dialect cleanup + truncation note |
 
 ## FAQ

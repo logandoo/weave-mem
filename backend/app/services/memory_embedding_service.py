@@ -39,11 +39,16 @@ def _get_client():
     时为 "no-key" 哨兵（a207ab59f 语义，SDK 原样发该头）。
     """
     global _sdk_client, _sdk_cache_key
-    base = _get_embedding_api_base() or None
+    # C1（双审）：base 为空时绝不传 None——SDK 会静默升至 api.openai.com（用户
+    # 内容外泄）；空 base 直接 fail-closed（旧 httpx 对空 base 即 UnsupportedProtocol）
+    base = _get_embedding_api_base()
+    if not base:
+        return None
     key = _get_embedding_api_key() or "dummy-key-for-header"
     cache_key = (base, key)
     if _sdk_client is None or _sdk_cache_key != cache_key:
         from openai import AsyncOpenAI
+        old_client = _sdk_client
         _sdk_client = AsyncOpenAI(
             base_url=base,
             api_key=key,
@@ -51,26 +56,35 @@ def _get_client():
             max_retries=0,
         )
         _sdk_cache_key = cache_key
+        if old_client is not None:
+            try:
+                import asyncio as _aio
+                _aio.get_running_loop().create_task(old_client.close())
+            except Exception:
+                pass
     return _sdk_client
 
 
 def _get_embedding_api_base() -> str:
-    base = config.memory.get("embedding_api_base", "")
+    # 新鲜 get_config()：SIGHUP/reload-config 后模块级 config 是旧实例
+    cfg = get_config()
+    base = cfg.memory.get("embedding_api_base", "")
     if base:
         return base.rstrip("/")
-    return config.api_base_url.rstrip("/")
+    return cfg.api_base_url.rstrip("/")
 
 
 def _get_embedding_api_key() -> str:
-    key = config.memory.get("embedding_api_key", "")
+    cfg = get_config()
+    key = cfg.memory.get("embedding_api_key", "")
     if key:
         return key
     # no-key 守卫（上游 a207ab59f，2026-09-02）：显式配置的 embedding 端点
     # （base_url 已填）空键 = 该服务不需要鉴权 → wire "no-key" 占位，
     # 绝不回落全局 LLM key（否则主 key 会随 Authorization 发给第三方 embedding 服务）
-    if config.memory.get("embedding_api_base", ""):
+    if cfg.memory.get("embedding_api_base", ""):
         return "no-key"
-    return config.api_key or ""
+    return cfg.api_key or ""
 
 
 def _get_embedding_dim() -> int:
@@ -118,11 +132,13 @@ async def _do_embed(text: str) -> Optional[list[float]]:
             return None
         _circuit_failures = 0
 
-    model = config.memory.get("embedding_model", "text-embedding-3-small")
+    model = get_config().memory.get("embedding_model", "text-embedding-3-small")
     client = _get_client()
+    if client is None:
+        return None  # 无 embedding 端点：fail-closed，绝不外发（C1）
 
     try:
-        resp = await client.embeddings.create(input=text, model=model)
+        resp = await client.embeddings.create(input=text, model=model, encoding_format="float")
         emb = resp.data[0].embedding
         _circuit_failures = 0
         return emb
@@ -385,17 +401,15 @@ async def _probe_main_provider() -> tuple[bool, Optional[int]]:
             return False, None
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-            resp = await client.post(
-                f"{base_url}/embeddings",
-                headers={"Authorization": f"Bearer {api_key}",
-                         "Content-Type": "application/json"},
-                json={"input": "probe", "model": model},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            emb = data["data"][0]["embedding"]
-            return True, len(emb)
+        # 出向归一（双审 I3）：探测同走官方 SDK + no-key 守卫（原手拼 httpx 且空键
+        # 发空 Bearer——与运行时语义分叉）
+        from openai import AsyncOpenAI
+        probe_key = _get_embedding_api_key() or "dummy-key-for-header"
+        async with AsyncOpenAI(base_url=base_url, api_key=probe_key,
+                               timeout=15.0, max_retries=0) as client:
+            resp = await client.embeddings.create(input="probe", model=model,
+                                                  encoding_format="float")
+            return True, len(resp.data[0].embedding)
     except Exception:
         logger.exception("embedding provider probe failed (base=%s)", base_url)
         return False, None
